@@ -1,0 +1,42 @@
+<project>
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>org.barbon.openjdk-memory-profiling</groupId>
+    <artifactId>test-agent</artifactId>
+    <version>0.0.1</version>
+    <packaging>nar</packaging>
+
+    <properties>
+        <maven.compiler.source>1.8</maven.compiler.source>
+        <maven.compiler.target>1.8</maven.compiler.target>
+    </properties>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>com.github.maven-nar</groupId>
+                <artifactId>nar-maven-plugin</artifactId>
+                <version>3.5.1</version>
+                <extensions>true</extensions>
+                <configuration>
+                    <javaHome>../../jdk8u/build/linux-x86_64-normal-server-release/jdk</javaHome>
+                    <cpp>
+                        <debug>true</debug>
+                    </cpp>
+                    <libraries>
+                        <library>
+                            <type>jni</type>
+                            <narSystemPackage>testAgent</narSystemPackage>
+                            <linkCPP>true</linkCPP>
+                        </library>
+                    </libraries>
+                    <javah>
+                        <includes>
+                            <include></include>
+                        </includes>
+                    </javah>
+                </configuration>
+            </plugin>
+        </plugins>
+   </build>
+</project>

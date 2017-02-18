@@ -1,0 +1,779 @@
+From 6a281c94c457b981b9d6c9216f515b09672e04f6 Mon Sep 17 00:00:00 2001
+From: Mattia Barbon <mattia@barbon.org>
+Date: Fri, 10 Feb 2017 18:19:09 +0100
+Subject: [PATCH 3/3] Add memory profiling support (requires a JDK patch)
+
+The JDK patch adds support for a callback called everry X bytes of allocated memory.
+
+There are some trivial changes to add configuration for memory profiling sample
+size and to find/invoke the function to set the callback.
+
+The bulk of the patch propagates the number of memory samples from the callback
+to the circual buffer, to the log writer, to the file reader. The number of
+samples is needed because when memory sample size is set (for example) to 65536
+bytes, a single 3MB allocation counts for 48 samples.
+---
+ CMakeLists.txt                                     |  2 +
+ src/main/cpp/agent.cpp                             | 19 +++++-
+ src/main/cpp/circular_queue.cpp                    |  9 +--
+ src/main/cpp/circular_queue.h                      |  7 ++-
+ src/main/cpp/control.cpp                           | 14 +++++
+ src/main/cpp/globals.h                             |  3 +
+ src/main/cpp/log_writer.cpp                        | 12 ++--
+ src/main/cpp/log_writer.h                          |  8 +--
+ src/main/cpp/memtrace.cpp                          | 38 ++++++++++++
+ src/main/cpp/memtrace.h                            | 10 ++++
+ src/main/cpp/processor.cpp                         |  6 +-
+ src/main/cpp/processor.h                           |  4 +-
+ src/main/cpp/profiler.cpp                          | 70 +++++++++++++++++++++-
+ src/main/cpp/profiler.h                            | 13 +++-
+ .../core/collector/FlameGraphCollector.java        |  6 +-
+ .../honest_profiler/core/control/Agent.java        |  4 ++
+ .../honest_profiler/core/parser/LogParser.java     |  6 +-
+ .../honest_profiler/core/parser/TraceStart.java    |  8 ++-
+ .../honest_profiler/core/profiles/FlameTrace.java  |  4 +-
+ src/test/cpp/fixtures.h                            |  6 +-
+ 20 files changed, 215 insertions(+), 34 deletions(-)
+ create mode 100644 src/main/cpp/memtrace.cpp
+ create mode 100644 src/main/cpp/memtrace.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8b0f317..1ccf3a2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -71,6 +71,8 @@ set(SOURCE_FILES
+     ${SRC}/profiler.cpp
+     ${SRC}/profiler.h
+     ${SRC}/stacktraces.h
++    ${SRC}/memtrace.cpp
++    ${SRC}/memtrace.h
+     ${SRC}/trace.h
+     ${SRC}/thread_map.h
+     ${SRC}/thread_map.cpp
+diff --git a/src/main/cpp/agent.cpp b/src/main/cpp/agent.cpp
+index 1f45121..0931741 100755
+--- a/src/main/cpp/agent.cpp
++++ b/src/main/cpp/agent.cpp
+@@ -8,6 +8,7 @@
+ #include "thread_map.h"
+ #include "profiler.h"
+ #include "controller.h"
++#include "memtrace.h"
+ 
+ #if defined(__APPLE__) || defined(__FreeBSD__)
+ #define GETENV_NEW_THREAD_ASYNC_UNSAFE
+@@ -74,6 +75,9 @@ void JNICALL OnVMInit(jvmtiEnv *jvmti, JNIEnv *jniEnv, jthread thread) {
+     if (CONFIGURATION->host != NULL && CONFIGURATION->port != NULL) {
+         controller->start();
+     }
++
++    if (CONFIGURATION->start)
++        prof->start(jniEnv);
+ #endif
+ }
+ 
+@@ -301,6 +305,8 @@ static void parseArguments(char *options, ConfigurationOptions &configuration) {
+                 configuration.port = safe_copy_string(value, next);
+             } else if (strstr(key, "maxFrames") == key) {
+                 configuration.maxFramesToCapture = atoi(value);
++            } else if (strstr(key, "memorySampleSize") == key) {
++                configuration.memorySampleSize = atoi(value);
+             } else {
+                 logError("WARN: Unknown configuration option: %s\n", key);
+             }
+@@ -343,6 +349,13 @@ AGENTEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved
+         return 1;
+     }
+ 
++    if (CONFIGURATION->memorySampleSize) {
++        if (!SetupMemoryProfiling(CONFIGURATION->memorySampleSize)) {
++            logError("ERROR: Failed to setup memory tracing\n");
++            return 1;
++        }
++    }
++
+     Asgct::SetAsgct(Accessors::GetJvmFunction<ASGCTType>("AsyncGetCallTrace"));
+ 
+     prof = new Profiler(jvm, jvmti, CONFIGURATION, threadMap);
+@@ -363,7 +376,11 @@ AGENTEXPORT void JNICALL Agent_OnUnload(JavaVM *vm) {
+ }
+ 
+ void bootstrapHandle(int signum, siginfo_t *info, void *context) {
+-    prof->handle(signum, info, context);
++    prof->handle(signum, info, context, 1);
++}
++
++void bootstrapMemoryHandle(void *context, jlong samples) {
++    prof->handle(-1, NULL, context, samples);
+ }
+ 
+ void logError(const char *__restrict format, ...) {
+diff --git a/src/main/cpp/circular_queue.cpp b/src/main/cpp/circular_queue.cpp
+index bcf1bf2..d8419c6 100644
+--- a/src/main/cpp/circular_queue.cpp
++++ b/src/main/cpp/circular_queue.cpp
+@@ -2,14 +2,14 @@
+ #include <iostream>
+ #include <unistd.h>
+ 
+-bool CircularQueue::push(const JVMPI_CallTrace &item, ThreadBucket *info) {
++bool CircularQueue::push(const JVMPI_CallTrace &item, ThreadBucket *info, jlong samples) {
+     timespec spec;
+     TimeUtils::current_utc_time(&spec);
+ 
+-    return push(spec, item, info);
++    return push(spec, item, info, samples);
+ }
+ 
+-bool CircularQueue::push(const timespec &ts, const JVMPI_CallTrace &item, ThreadBucket *info) {
++bool CircularQueue::push(const timespec &ts, const JVMPI_CallTrace &item, ThreadBucket *info, jlong samples) {
+     size_t currentInput;
+     size_t nextInput;
+     do {
+@@ -24,6 +24,7 @@ bool CircularQueue::push(const timespec &ts, const JVMPI_CallTrace &item, Thread
+     buffer[currentInput].tspec.tv_sec = ts.tv_sec;
+     buffer[currentInput].tspec.tv_nsec = ts.tv_nsec;
+     buffer[currentInput].info = info;
++    buffer[currentInput].samples = samples;
+     buffer[currentInput].is_committed.store(COMMITTED, std::memory_order_release);
+ 
+     return true;
+@@ -57,7 +58,7 @@ bool CircularQueue::pop() {
+         usleep(1);
+     }
+ 
+-    listener_.record(buffer[current_output].tspec, buffer[current_output].trace, buffer[current_output].info);
++    listener_.record(buffer[current_output].tspec, buffer[current_output].trace, buffer[current_output].info, buffer[current_output].samples);
+     
+     // 0 out all frames so the next write is clean
+     JVMPI_CallFrame *fb = frame_buffer_[current_output];
+diff --git a/src/main/cpp/circular_queue.h b/src/main/cpp/circular_queue.h
+index b6df463..9aa3aa2 100644
+--- a/src/main/cpp/circular_queue.h
++++ b/src/main/cpp/circular_queue.h
+@@ -22,7 +22,7 @@ const size_t Capacity = Size + 1;
+ 
+ class QueueListener {
+ public:
+-    virtual void record(const timespec &ts, const JVMPI_CallTrace &item, ThreadBucket *info = nullptr) = 0;
++    virtual void record(const timespec &ts, const JVMPI_CallTrace &item, ThreadBucket *info = nullptr, jlong samples = 1) = 0;
+ 
+     virtual ~QueueListener() {
+     }
+@@ -36,6 +36,7 @@ struct TraceHolder {
+     std::atomic<int> is_committed;
+     JVMPI_CallTrace trace;
+     ThreadBucket *info;
++    jlong samples;
+ };
+ 
+ class CircularQueue {
+@@ -52,9 +53,9 @@ public:
+             delete[] frame_buffer_[i];
+     }
+ 
+-    bool push(const timespec &ts, const JVMPI_CallTrace &item, ThreadBucket *info = nullptr);
++    bool push(const timespec &ts, const JVMPI_CallTrace &item, ThreadBucket *info = nullptr, jlong samples = 1);
+ 
+-    bool push(const JVMPI_CallTrace &item, ThreadBucket *info = nullptr);
++    bool push(const JVMPI_CallTrace &item, ThreadBucket *info = nullptr, jlong samples = 1);
+ 
+     bool pop();
+ 
+diff --git a/src/main/cpp/control.cpp b/src/main/cpp/control.cpp
+index dae7e2a..3042e99 100644
+--- a/src/main/cpp/control.cpp
++++ b/src/main/cpp/control.cpp
+@@ -67,6 +67,13 @@ JNIEXPORT jint JNICALL Java_com_insightfullogic_honest_1profiler_core_control_Ag
+ }
+ 
+ extern "C"
++JNIEXPORT jint JNICALL Java_com_insightfullogic_honest_1profiler_core_control_Agent_getMemorySamplingSize(JNIEnv *env, jclass klass) {
++    Profiler *prof = getProfiler();
++
++    return prof->getMemorySamplingSize();
++}
++
++extern "C"
+ JNIEXPORT jstring JNICALL Java_com_insightfullogic_honest_1profiler_core_control_Agent_getFilePath(JNIEnv *env, jclass klass) {
+     Profiler *prof = getProfiler();
+ 
+@@ -99,3 +106,10 @@ JNIEXPORT void JNICALL Java_com_insightfullogic_honest_1profiler_core_control_Ag
+ 
+     prof->setMaxFramesToCapture(maxFramesToCapture);
+ }
++
++extern "C"
++JNIEXPORT void JNICALL Java_com_insightfullogic_honest_1profiler_core_control_Agent_setMemorySamplingSize(JNIEnv *env, jclass klass, jint size) {
++    Profiler *prof = getProfiler();
++
++    prof->setMemorySamplingSize(size);
++}
+diff --git a/src/main/cpp/globals.h b/src/main/cpp/globals.h
+index 4ab3fc2..56cc1a2 100755
+--- a/src/main/cpp/globals.h
++++ b/src/main/cpp/globals.h
+@@ -39,6 +39,7 @@ void safe_free_string(char *&value);
+ struct ConfigurationOptions {
+     /** Interval in microseconds */
+     int samplingIntervalMin, samplingIntervalMax;
++    int memorySampleSize;
+     char* logFilePath;
+     char* host;
+     char* port;
+@@ -48,6 +49,7 @@ struct ConfigurationOptions {
+     ConfigurationOptions() :
+             samplingIntervalMin(DEFAULT_SAMPLING_INTERVAL),
+             samplingIntervalMax(DEFAULT_SAMPLING_INTERVAL),
++            memorySampleSize(0),
+             logFilePath(NULL),
+             host(NULL),
+             port(NULL),
+@@ -178,6 +180,7 @@ public:
+ };
+ 
+ void bootstrapHandle(int signum, siginfo_t *info, void *context);
++void bootstrapMemoryHandle(void *context, jlong samples);
+ 
+ #ifdef __MACH__
+ static clock_serv_t osx_clock;
+diff --git a/src/main/cpp/log_writer.cpp b/src/main/cpp/log_writer.cpp
+index 1153234..1392add 100644
+--- a/src/main/cpp/log_writer.cpp
++++ b/src/main/cpp/log_writer.cpp
+@@ -78,15 +78,15 @@ jint LogWriter::getLineNo(jint bci, jmethodID methodId) {
+     return lineno;
+ }
+ 
+-void LogWriter::record(const JVMPI_CallTrace &trace, ThreadBucket *info) {
++void LogWriter::record(const JVMPI_CallTrace &trace, ThreadBucket *info, jlong samples) {
+     timespec spec;
+     TimeUtils::current_utc_time(&spec);
+ 
+     record(spec, trace, info);
+ }
+ 
+-void LogWriter::record(const timespec &ts, const JVMPI_CallTrace &trace, ThreadBucket *info) {
+-    recordTraceStart(trace.num_frames, (map::HashType)trace.env_id, ts, info);
++void LogWriter::record(const timespec &ts, const JVMPI_CallTrace &trace, ThreadBucket *info, jlong samples) {
++    recordTraceStart(trace.num_frames, (map::HashType)trace.env_id, ts, info, samples);
+ 
+     for (int i = 0; i < trace.num_frames; i++) {
+         JVMPI_CallFrame frame = trace.frames[i];
+@@ -138,7 +138,7 @@ void LogWriter::inspectThread(map::HashType &threadId, ThreadBucket *info) {
+     output_.flush();
+ }
+ 
+-void LogWriter::recordTraceStart(const jint numFrames, map::HashType envHash, ThreadBucket *info) {
++void LogWriter::recordTraceStart(const jint numFrames, map::HashType envHash, ThreadBucket *info, jlong samples) {
+     map::HashType threadId = -envHash;
+ 
+     inspectThread(threadId, info);
+@@ -146,10 +146,11 @@ void LogWriter::recordTraceStart(const jint numFrames, map::HashType envHash, Th
+     output_.put(TRACE_START);
+     writeValue(numFrames);
+     writeValue(threadId);
++    writeValue(samples);
+     output_.flush();
+ }
+ 
+-void LogWriter::recordTraceStart(const jint numFrames, map::HashType envHash, const timespec &ts, ThreadBucket *info) {
++void LogWriter::recordTraceStart(const jint numFrames, map::HashType envHash, const timespec &ts, ThreadBucket *info, jlong samples) {
+     map::HashType threadId = -envHash; // mark unrecognized threads with negative id's
+     
+     inspectThread(threadId, info);
+@@ -159,6 +160,7 @@ void LogWriter::recordTraceStart(const jint numFrames, map::HashType envHash, co
+     writeValue(threadId);
+     writeValue((int64_t)ts.tv_sec);
+     writeValue((int64_t)ts.tv_nsec);
++    writeValue(samples);
+     output_.flush();
+ }
+ 
+diff --git a/src/main/cpp/log_writer.h b/src/main/cpp/log_writer.h
+index e3e884b..d557555 100644
+--- a/src/main/cpp/log_writer.h
++++ b/src/main/cpp/log_writer.h
+@@ -51,13 +51,13 @@ public:
+             : output_(output), frameLookup_(frameLookup), jvmti_(jvmti) {
+     }
+ 
+-    virtual void record(const timespec &ts, const JVMPI_CallTrace &trace, ThreadBucket *info = nullptr);
++    virtual void record(const timespec &ts, const JVMPI_CallTrace &trace, ThreadBucket *info = nullptr, jlong samples = 1);
+ 
+-    void record(const JVMPI_CallTrace &trace, ThreadBucket *info = nullptr);
++    void record(const JVMPI_CallTrace &trace, ThreadBucket *info = nullptr, jlong samples = 1);
+ 
+-    void recordTraceStart(const jint numFrames, map::HashType envHash, ThreadBucket *info);
++    void recordTraceStart(const jint numFrames, map::HashType envHash, ThreadBucket *info, jlong samples = 1);
+ 
+-    void recordTraceStart(const jint numFrames, map::HashType envHash, const timespec &ts, ThreadBucket *info);
++    void recordTraceStart(const jint numFrames, map::HashType envHash, const timespec &ts, ThreadBucket *info, jlong samples = 1);
+ 
+     // method are unique pointers, use a long to standardise
+     // between 32 and 64 bits
+diff --git a/src/main/cpp/memtrace.cpp b/src/main/cpp/memtrace.cpp
+new file mode 100644
+index 0000000..8f8f52e
+--- /dev/null
++++ b/src/main/cpp/memtrace.cpp
+@@ -0,0 +1,38 @@
++#include <string.h>
++#include <ucontext.h>
++
++#include "memtrace.h"
++
++extern "C" {
++    typedef void (*MemTrack_userCallback)(jlong samples);
++    typedef void (*MemTrack_setUserCallbackType)(MemTrack_userCallback callback, jlong sampleSize);
++}
++
++static MemTrack_setUserCallbackType SetUserCallback;
++static int samplingSize;
++
++static void CallProfiler(jlong samples) {
++    ucontext_t uContext;
++
++    if (getcontext(&uContext) != 0)
++        return;
++    bootstrapMemoryHandle(&uContext, samples);
++}
++
++bool SetupMemoryProfiling(int memorySampleSize) {
++    if (SetUserCallback == NULL)
++        SetUserCallback = Accessors::GetJvmFunction<MemTrack_setUserCallbackType>("MemTrack_setUserCallback");
++    if (SetUserCallback == NULL)
++        return false;
++    SetUserCallback(NULL, 0x007fffffffffffff);
++    samplingSize = memorySampleSize;
++    return true;
++}
++
++void StartMemoryProfiling() {
++    SetUserCallback(&CallProfiler, samplingSize);
++}
++
++void StopMemoryProfiling() {
++    SetUserCallback(NULL, 0x007fffffffffffff);
++}
+diff --git a/src/main/cpp/memtrace.h b/src/main/cpp/memtrace.h
+new file mode 100644
+index 0000000..20a4ccc
+--- /dev/null
++++ b/src/main/cpp/memtrace.h
+@@ -0,0 +1,10 @@
++#include "globals.h"
++
++#ifndef MEMTRACE_H
++#define MEMTRACE_H
++
++bool SetupMemoryProfiling(int memorySampleSize);
++void StartMemoryProfiling();
++void StopMemoryProfiling();
++
++#endif // MEMTRACE_H
+diff --git a/src/main/cpp/processor.cpp b/src/main/cpp/processor.cpp
+index 3ef6dcb..079cb37 100644
+--- a/src/main/cpp/processor.cpp
++++ b/src/main/cpp/processor.cpp
+@@ -35,7 +35,8 @@ void Processor::run() {
+         }
+ 
+         if (popped > 200) {
+-            if (!handler_.updateSigprofInterval()) {
++            if (updateInterval_.load(std::memory_order_relaxed) &&
++                  !handler_.updateSigprofInterval()) {
+                 break;
+             }
+             popped = 0;
+@@ -67,11 +68,12 @@ void callbackToRunProcessor(jvmtiEnv *jvmti_env, JNIEnv *jni_env, void *arg) {
+     processor->run();
+ }
+ 
+-void Processor::start(JNIEnv *jniEnv) {
++void Processor::start(JNIEnv *jniEnv, bool updateInterval) {
+     TRACE(Processor, kTraceProcessorStart);
+     jvmtiError result;
+ 
+     std::cout << "Starting sampling\n";
++    updateInterval_.store(updateInterval, std::memory_order_relaxed);
+     isRunning_.store(true, std::memory_order_relaxed);
+     workerDone.test_and_set(std::memory_order_relaxed); // initial is true
+     jthread thread = newThread(jniEnv, "Honest Profiler Processing Thread");
+diff --git a/src/main/cpp/processor.h b/src/main/cpp/processor.h
+index d17c0eb..08fa4b3 100644
+--- a/src/main/cpp/processor.h
++++ b/src/main/cpp/processor.h
+@@ -26,7 +26,7 @@ public:
+           isRunning_(false), handler_(handler), interval_(interval) {
+     }
+ 
+-    void start(JNIEnv *jniEnv);
++    void start(JNIEnv *jniEnv, bool updateInterval);
+ 
+     void run();
+ 
+@@ -43,6 +43,8 @@ private:
+ 
+     std::atomic_bool isRunning_;
+ 
++    std::atomic_bool updateInterval_;
++
+     std::atomic_flag workerDone;
+ 
+     SignalHandler& handler_;
+diff --git a/src/main/cpp/profiler.cpp b/src/main/cpp/profiler.cpp
+index a05ffc0..8cfa5e4 100755
+--- a/src/main/cpp/profiler.cpp
++++ b/src/main/cpp/profiler.cpp
+@@ -1,4 +1,5 @@
+ #include "profiler.h"
++#include "memtrace.h"
+ 
+ ASGCTType Asgct::asgct_;
+ 
+@@ -67,7 +68,7 @@ bool Profiler::lookupFrameInformation(const JVMPI_CallFrame &frame,
+     return true;
+ }
+ 
+-void Profiler::handle(int signum, siginfo_t *info, void *context) {
++void Profiler::handle(int signum, siginfo_t *info, void *context, jlong samples) {
+     IMPLICITLY_USE(signum);
+     IMPLICITLY_USE(info);
+     SimpleSpinLockGuard<false> guard(ongoingConf); // sync buffer
+@@ -92,7 +93,7 @@ void Profiler::handle(int signum, siginfo_t *info, void *context) {
+     }
+ 
+     // log all samples, failures included, let the post processing sift through the data
+-    buffer->push(spec, trace, threadInfo);
++    buffer->push(spec, trace, threadInfo, samples);
+ }
+ 
+ bool Profiler::start(JNIEnv *jniEnv) {
+@@ -110,14 +111,31 @@ bool Profiler::start(JNIEnv *jniEnv) {
+     if (reloadConfig)
+         configure();
+ 
++    if (configuration_->memorySampleSize)
++        return startMemory(jniEnv);
++    else
++        return startCpu(jniEnv);
++}
++
++bool Profiler::startCpu(JNIEnv *jniEnv) {
++    /* within critical section */
++
+     // reference back to Profiler::handle on the singleton
+     // instance of Profiler
+     handler_->SetAction(&bootstrapHandle);
+-    processor->start(jniEnv);
++    processor->start(jniEnv, true);
+     bool res = handler_->updateSigprofInterval();
+     return res;
+ }
+ 
++bool Profiler::startMemory(JNIEnv *jniEnv) {
++    /* within critical section */
++
++    StartMemoryProfiling();
++    processor->start(jniEnv, false);
++    return true;
++}
++
+ void Profiler::stop() {
+     /* Make sure it doesn't overlap with configure */
+     SimpleSpinLockGuard<true> guard(ongoingConf);
+@@ -127,11 +145,27 @@ void Profiler::stop() {
+         return;
+     }
+ 
++    if (configuration_->memorySampleSize)
++        stopMemory();
++    else
++        stopCpu();
++}
++
++void Profiler::stopCpu() {
++    /* Make sure it doesn't overlap with configure */
++
+     handler_->stopSigprof();
+     processor->stop();
+     signal(SIGPROF, SIG_IGN);
+ }
+ 
++void Profiler::stopMemory() {
++    /* Make sure it doesn't overlap with configure */
++
++    StopMemoryProfiling();
++    processor->stop();
++}
++
+ bool Profiler::isRunning() {
+     /* Make sure it doesn't overlap with configure */
+     SimpleSpinLockGuard<true> guard(ongoingConf, false);
+@@ -202,6 +236,23 @@ void Profiler::setMaxFramesToCapture(int maxFramesToCapture) {
+     reloadConfig = true;
+ }
+ 
++void Profiler::setMemorySamplingSize(int size) {
++    /* Make sure it doesn't overlap with other sets */
++    SimpleSpinLockGuard<true> guard(ongoingConf);
++
++    if (__is_running()) {
++        TRACE(Profiler, kTraceProfilerSetMemorySamplingFailed);
++        logError("WARN: Unable to modify running profiler\n");
++        return;
++    }
++
++    TRACE(Profiler, kTraceProfilerSetMemorySamplingOk);
++
++    int res = size >= 0 ? size : 0;
++    liveConfiguration->memorySampleSize = res;
++    reloadConfig = true;
++}
++
+ /* return copy of the string */
+ std::string Profiler::getFilePath() {
+     /* Make sure it doesn't overlap with setFilePath */
+@@ -229,6 +280,11 @@ int Profiler::getMaxFramesToCapture() {
+     return liveConfiguration->maxFramesToCapture;
+ }
+ 
++int Profiler::getMemorySamplingSize() {
++    SimpleSpinLockGuard<false> guard(ongoingConf); // nonblocking
++    return liveConfiguration->memorySampleSize;
++}
++
+ void Profiler::configure() {
+     /* nested critical section, no need to acquire or CAS */
+     bool needsUpdate = processor == NULL;
+@@ -269,6 +325,14 @@ void Profiler::configure() {
+     }
+ 
+     needsUpdate = needsUpdate ||
++                  configuration_->memorySampleSize != liveConfiguration->memorySampleSize;
++    if (needsUpdate) {
++        configuration_->memorySampleSize = liveConfiguration->memorySampleSize;
++        SetupMemoryProfiling(configuration_->memorySampleSize);
++        StartMemoryProfiling();
++    }
++
++    needsUpdate = needsUpdate ||
+                   configuration_->samplingIntervalMin != liveConfiguration->samplingIntervalMin ||
+                   configuration_->samplingIntervalMax != liveConfiguration->samplingIntervalMax;
+     if (needsUpdate) {
+diff --git a/src/main/cpp/profiler.h b/src/main/cpp/profiler.h
+index 0685fe6..1682872 100755
+--- a/src/main/cpp/profiler.h
++++ b/src/main/cpp/profiler.h
+@@ -84,6 +84,7 @@ public:
+         setSamplingInterval(liveConfiguration->samplingIntervalMin,
+                             liveConfiguration->samplingIntervalMax);
+         setMaxFramesToCapture(liveConfiguration->maxFramesToCapture);
++        setMemorySamplingSize(liveConfiguration->memorySampleSize);
+ 
+         configure();
+     }
+@@ -92,7 +93,7 @@ public:
+ 
+     void stop();
+ 
+-    void handle(int signum, siginfo_t *info, void *context);
++    void handle(int signum, siginfo_t *info, void *context, jlong samples);
+ 
+     bool isRunning();
+ 
+@@ -106,12 +107,16 @@ public:
+ 
+     int getMaxFramesToCapture();
+ 
++    int getMemorySamplingSize();
++
+     void setFilePath(char *newFilePath);
+ 
+     void setSamplingInterval(int intervalMin, int intervalMax);
+ 
+     void setMaxFramesToCapture(int maxFramesToCapture);
+ 
++    void setMemorySamplingSize(int size);
++
+     ~Profiler();
+ 
+ private:
+@@ -152,6 +157,12 @@ private:
+ 
+     bool __is_running();
+ 
++    bool startCpu(JNIEnv *jniEnv);
++    bool startMemory(JNIEnv *jniEnv);
++
++    void stopCpu();
++    void stopMemory();
++
+     DISALLOW_COPY_AND_ASSIGN(Profiler);
+ };
+ 
+diff --git a/src/main/java/com/insightfullogic/honest_profiler/core/collector/FlameGraphCollector.java b/src/main/java/com/insightfullogic/honest_profiler/core/collector/FlameGraphCollector.java
+index 8a04075..cc2f6a6 100644
+--- a/src/main/java/com/insightfullogic/honest_profiler/core/collector/FlameGraphCollector.java
++++ b/src/main/java/com/insightfullogic/honest_profiler/core/collector/FlameGraphCollector.java
+@@ -49,6 +49,7 @@ public class FlameGraphCollector implements LogEventListener
+     private FlameTrace trace;
+     private List<Long> lastMethodIds = new ArrayList<>();
+     private List<Long> currentMethodIds = new ArrayList<>();
++    private long currentSamples;
+ 
+     private static Method unknownMethod = new Method(-1, "<unknown>", "unknown.Unknown", "unknown");
+ 
+@@ -63,6 +64,7 @@ public class FlameGraphCollector implements LogEventListener
+         addCurrentTrace();
+         lastMethodIds = currentMethodIds;
+         currentMethodIds = new ArrayList<>();
++        currentSamples = traceStart.getSamples();
+     }
+ 
+     @Override
+@@ -107,7 +109,7 @@ public class FlameGraphCollector implements LogEventListener
+ 
+         if (lastMethodIds.equals(currentMethodIds))
+         {
+-            trace.incrementWeight();
++            trace.incrementWeight(currentSamples);
+             return;
+         }
+ 
+@@ -116,7 +118,7 @@ public class FlameGraphCollector implements LogEventListener
+             .map(method -> this.methods.getOrDefault(method, unknownMethod))
+             .collect(toList());
+ 
+-        trace = new FlameTrace(methods, 1);
++        trace = new FlameTrace(methods, currentSamples);
+         flameGraph.onNewTrace(trace);
+     }
+ }
+diff --git a/src/main/java/com/insightfullogic/honest_profiler/core/control/Agent.java b/src/main/java/com/insightfullogic/honest_profiler/core/control/Agent.java
+index 8645700..77c4c01 100644
+--- a/src/main/java/com/insightfullogic/honest_profiler/core/control/Agent.java
++++ b/src/main/java/com/insightfullogic/honest_profiler/core/control/Agent.java
+@@ -35,6 +35,8 @@ public class Agent
+ 
+     public static native int getMaxFramesToCapture();
+ 
++    public static native int getMemorySamplingSize();
++
+     public static native String getFilePath();
+ 
+     public static native void setFilePath(String filePath);
+@@ -42,4 +44,6 @@ public class Agent
+     public static native void setSamplingInterval(int intervalMin, int intervalMax);
+ 
+     public static native void setMaxFramesToCapture(int maxFramesToCapture);
++
++    public static native void setMemorySamplingSize(int size);
+ }
+diff --git a/src/main/java/com/insightfullogic/honest_profiler/core/parser/LogParser.java b/src/main/java/com/insightfullogic/honest_profiler/core/parser/LogParser.java
+index b27b90f..3ea9de7 100644
+--- a/src/main/java/com/insightfullogic/honest_profiler/core/parser/LogParser.java
++++ b/src/main/java/com/insightfullogic/honest_profiler/core/parser/LogParser.java
+@@ -180,11 +180,13 @@ public class LogParser
+         long threadId = input.getLong();
+         long timeSec = 0L;
+         long timeNano = 0L;
++        long samples = 0L;
+ 
+         if (withTime) {
+             timeSec = input.getLong();
+             timeNano = input.getLong();
+         }
++        samples = input.getLong();
+ 
+         // number of frames <= 0 -> error, so log a mock stack frame reflecting the error. Logging errors as frames makes
+         // more sense when collecting profiles.
+@@ -197,13 +199,13 @@ public class LogParser
+             }
+ 
+             // we choose to report errors via frames, so pretend there's a single frame in the trace
+-            new TraceStart(1, threadId, timeSec, timeNano).accept(listener);
++            new TraceStart(1, threadId, timeSec, timeNano, samples).accept(listener);
+             // we shift the err code by -1 to avoid using the valid NULL jmethodId
+             new StackFrame(-1, numberOfFrames - 1).accept(listener);
+         }
+         else
+         {
+-            TraceStart traceStart = new TraceStart(numberOfFrames, threadId, timeSec, timeNano);
++            TraceStart traceStart = new TraceStart(numberOfFrames, threadId, timeSec, timeNano, samples);
+             traceStart.accept(listener);
+         }
+     }
+diff --git a/src/main/java/com/insightfullogic/honest_profiler/core/parser/TraceStart.java b/src/main/java/com/insightfullogic/honest_profiler/core/parser/TraceStart.java
+index 2686f8b..b4afccf 100644
+--- a/src/main/java/com/insightfullogic/honest_profiler/core/parser/TraceStart.java
++++ b/src/main/java/com/insightfullogic/honest_profiler/core/parser/TraceStart.java
+@@ -31,13 +31,15 @@ public final class TraceStart implements LogEvent
+     private final long threadId;
+     private final long timeSec;
+     private final long timeNano;
++    private final long samples;
+ 
+-    public TraceStart(int numberOfFrames, long threadId, long timeSec, long timeNano)
++    public TraceStart(int numberOfFrames, long threadId, long timeSec, long timeNano, long samples)
+     {
+         this.numberOfFrames = numberOfFrames;
+         this.threadId = threadId;
+         this.timeSec = timeSec;
+         this.timeNano = timeNano;
++        this.samples = samples;
+     }
+ 
+     public int getNumberOfFrames()
+@@ -60,6 +62,10 @@ public final class TraceStart implements LogEvent
+         return timeNano;
+     }
+ 
++    public long getSamples() {
++        return samples;
++    }
++
+     @Override
+     public boolean equals(Object o)
+     {
+diff --git a/src/main/java/com/insightfullogic/honest_profiler/core/profiles/FlameTrace.java b/src/main/java/com/insightfullogic/honest_profiler/core/profiles/FlameTrace.java
+index c7bafb1..e1883bd 100644
+--- a/src/main/java/com/insightfullogic/honest_profiler/core/profiles/FlameTrace.java
++++ b/src/main/java/com/insightfullogic/honest_profiler/core/profiles/FlameTrace.java
+@@ -55,8 +55,8 @@ public class FlameTrace
+         return methods.size() > row ? methods.get(row) : null;
+     }
+ 
+-    public void incrementWeight()
++    public void incrementWeight(long increment)
+     {
+-        weight++;
++        weight += increment;
+     }
+ }
+diff --git a/src/test/cpp/fixtures.h b/src/test/cpp/fixtures.h
+index d950d6a..47feca6 100644
+--- a/src/test/cpp/fixtures.h
++++ b/src/test/cpp/fixtures.h
+@@ -8,14 +8,14 @@ class ItemHolder : public QueueListener {
+ public:
+   explicit ItemHolder() {}
+ 
+-  void record(const JVMPI_CallTrace &trace, ThreadBucket *info) {
++  void record(const JVMPI_CallTrace &trace, ThreadBucket *info, jlong samples = 1) {
+     timespec spec;
+     TimeUtils::current_utc_time(&spec);
+ 
+-    record(spec, trace, info);
++    record(spec, trace, info, samples);
+   }
+ 
+-  virtual void record(const timespec &ts, const JVMPI_CallTrace &trace, ThreadBucket *info) {
++  virtual void record(const timespec &ts, const JVMPI_CallTrace &trace, ThreadBucket *info, jlong samples = 1) {
+     CHECK_EQUAL(2, trace.num_frames);
+     CHECK_EQUAL((JNIEnv *)envId, trace.env_id);
+ 
+-- 
+2.11.1
+

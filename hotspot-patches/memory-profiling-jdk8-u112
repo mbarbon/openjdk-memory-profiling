@@ -1,0 +1,531 @@
+# HG changeset patch
+# Parent  87440ed4e1de7753a436f957d35555d8b4e26f1d
+
+diff -r 87440ed4e1de make/linux/makefiles/mapfile-vers-debug
+--- a/make/linux/makefiles/mapfile-vers-debug	Mon Oct 03 08:13:41 2016 -0700
++++ b/make/linux/makefiles/mapfile-vers-debug	Sat Feb 18 22:31:11 2017 +0100
+@@ -270,6 +270,9 @@
+                 # This is for Forte Analyzer profiling support.
+                 AsyncGetCallTrace;
+ 
++                # Sampling memory tracing
++                MemTrack_setUserCallback;
++
+ 		# INSERT VTABLE SYMBOLS HERE
+ 
+         local:
+diff -r 87440ed4e1de make/linux/makefiles/mapfile-vers-product
+--- a/make/linux/makefiles/mapfile-vers-product	Mon Oct 03 08:13:41 2016 -0700
++++ b/make/linux/makefiles/mapfile-vers-product	Sat Feb 18 22:31:11 2017 +0100
+@@ -265,6 +265,9 @@
+                 # This is for Forte Analyzer profiling support.
+                 AsyncGetCallTrace;
+ 
++                # Sampling memory tracing
++                MemTrack_setUserCallback;
++
+ 		# INSERT VTABLE SYMBOLS HERE
+ 
+         local:
+diff -r 87440ed4e1de src/cpu/x86/vm/macroAssembler_x86.cpp
+--- a/src/cpu/x86/vm/macroAssembler_x86.cpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/cpu/x86/vm/macroAssembler_x86.cpp	Sat Feb 18 22:31:11 2017 +0100
+@@ -2987,6 +2987,23 @@
+     // it otherwise. Use lock prefix for atomicity on MPs.
+     locked_cmpxchgptr(end, heap_top);
+     jcc(Assembler::notEqual, retry);
++
++    if (MemTrack_SampleMemoryAllocationSize > 0) {
++      Label dont_track;
++      Register thread = NOT_LP64(t1) LP64_ONLY(r15_thread);
++
++      NOT_LP64(get_thread(thread));
++
++      if (var_size_in_bytes == noreg) {
++        subq(Address(thread, in_bytes(JavaThread::thingie_offset())), con_size_in_bytes);
++      } else {
++        subq(Address(thread, in_bytes(JavaThread::thingie_offset())), var_size_in_bytes);
++      }
++
++      jcc(Assembler::positive, dont_track);
++      call(RuntimeAddress(StubRoutines::x86::track_memory_sample()));
++      bind(dont_track);
++    }
+   }
+ }
+ 
+@@ -4441,6 +4458,20 @@
+     subptr(var_size_in_bytes, obj);
+   }
+   verify_tlab();
++
++  if (MemTrack_SampleMemoryAllocationSize > 0) {
++    Label dont_track;
++
++    if (var_size_in_bytes == noreg) {
++      subq(Address(thread, in_bytes(JavaThread::thingie_offset())), con_size_in_bytes);
++    } else {
++      subq(Address(thread, in_bytes(JavaThread::thingie_offset())), var_size_in_bytes);
++    }
++
++    jcc(Assembler::positive, dont_track);
++    call(RuntimeAddress(StubRoutines::x86::track_memory_sample()));
++    bind(dont_track);
++  }
+ }
+ 
+ // Preserves rbx, and rdx.
+diff -r 87440ed4e1de src/cpu/x86/vm/stubGenerator_x86_64.cpp
+--- a/src/cpu/x86/vm/stubGenerator_x86_64.cpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/cpu/x86/vm/stubGenerator_x86_64.cpp	Sat Feb 18 22:31:11 2017 +0100
+@@ -42,6 +42,7 @@
+ #ifdef COMPILER2
+ #include "opto/runtime.hpp"
+ #endif
++#include "prims/piano.hpp"
+ 
+ // Declaration and definition of StubGenerator (no .hpp file).
+ // For a more detailed description of the stub routine structure
+@@ -752,6 +753,25 @@
+     return start;
+   }
+ 
++  address generate_track_memory_sample() {
++    StubCodeMark mark(this, "StubRoutines", "track_memory_sample");
++    address start = __ pc();
++
++    if (MemTrack_SampleMemoryAllocationSize > 0) {
++      __ enter();
++      __ andq(rsp, -16);
++      __ push_CPU_state();
++      __ mov(c_rarg0, r15_thread);
++      __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, MemTrack_trackAllocationAfterDecrement)));
++      __ pop_CPU_state();
++      __ leave();
++    }
++
++    __ ret(0);
++
++    return start;
++  }
++
+   address generate_f2i_fixup() {
+     StubCodeMark mark(this, "StubRoutines", "f2i_fixup");
+     Address inout(rsp, 5 * wordSize); // return address + 4 saves
+@@ -4077,6 +4097,8 @@
+       StubRoutines::_cipherBlockChaining_decryptAESCrypt = generate_cipherBlockChaining_decryptAESCrypt_Parallel();
+     }
+ 
++    StubRoutines::x86::_track_memory_sample = generate_track_memory_sample();
++
+     // Safefetch stubs.
+     generate_safefetch("SafeFetch32", sizeof(int),     &StubRoutines::_safefetch32_entry,
+                                                        &StubRoutines::_safefetch32_fault_pc,
+diff -r 87440ed4e1de src/cpu/x86/vm/stubRoutines_x86.cpp
+--- a/src/cpu/x86/vm/stubRoutines_x86.cpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/cpu/x86/vm/stubRoutines_x86.cpp	Sat Feb 18 22:31:11 2017 +0100
+@@ -32,6 +32,7 @@
+ // a description of how to extend it, see the stubRoutines.hpp file.
+ 
+ address StubRoutines::x86::_verify_mxcsr_entry = NULL;
++address StubRoutines::x86::_track_memory_sample = NULL;
+ address StubRoutines::x86::_key_shuffle_mask_addr = NULL;
+ 
+ uint64_t StubRoutines::x86::_crc_by128_masks[] =
+diff -r 87440ed4e1de src/cpu/x86/vm/stubRoutines_x86.hpp
+--- a/src/cpu/x86/vm/stubRoutines_x86.hpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/cpu/x86/vm/stubRoutines_x86.hpp	Sat Feb 18 22:31:11 2017 +0100
+@@ -33,6 +33,7 @@
+   static address _verify_mxcsr_entry;
+   // shuffle mask for fixing up 128-bit words consisting of big-endian 32-bit integers
+   static address _key_shuffle_mask_addr;
++  static address _track_memory_sample;
+   // masks and table for CRC32
+   static uint64_t _crc_by128_masks[];
+   static juint    _crc_table[];
+@@ -40,6 +41,7 @@
+  public:
+   static address verify_mxcsr_entry()    { return _verify_mxcsr_entry; }
+   static address key_shuffle_mask_addr() { return _key_shuffle_mask_addr; }
++  static address track_memory_sample()   { return _track_memory_sample; }
+   static address crc_by128_masks_addr()  { return (address)_crc_by128_masks; }
+ 
+ #endif // CPU_X86_VM_STUBROUTINES_X86_32_HPP
+diff -r 87440ed4e1de src/cpu/x86/vm/templateTable_x86_64.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_64.cpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/cpu/x86/vm/templateTable_x86_64.cpp	Sat Feb 18 22:31:11 2017 +0100
+@@ -36,6 +36,7 @@
+ #include "runtime/stubRoutines.hpp"
+ #include "runtime/synchronizer.hpp"
+ #include "utilities/macros.hpp"
++#include "prims/piano.hpp"
+ 
+ #ifndef CC_INTERP
+ 
+@@ -3351,6 +3352,10 @@
+     __ cmpptr(rbx, Address(r15_thread, in_bytes(JavaThread::tlab_end_offset())));
+     __ jcc(Assembler::above, allow_shared_alloc ? allocate_shared : slow_case);
+     __ movptr(Address(r15_thread, in_bytes(JavaThread::tlab_top_offset())), rbx);
++    if (MemTrack_SampleMemoryAllocationSize > 0) {
++      __ subq(Address(r15_thread, in_bytes(JavaThread::thingie_offset())), rdx);
++    }
++
+     if (ZeroTLAB) {
+       // the fields have been already cleared
+       __ jmp(initialize_header);
+@@ -3399,6 +3404,9 @@
+     __ jcc(Assembler::notEqual, retry);
+ 
+     __ incr_allocated_bytes(r15_thread, rdx, 0);
++    if (MemTrack_SampleMemoryAllocationSize > 0) {
++      __ subq(Address(r15_thread, in_bytes(JavaThread::thingie_offset())), rdx);
++    }
+   }
+ 
+   if (UseTLAB || Universe::heap()->supports_inline_contig_alloc()) {
+@@ -3443,6 +3451,18 @@
+       __ pop(atos); // restore the return value
+ 
+     }
++
++    if (MemTrack_SampleMemoryAllocationSize > 0) {
++      Label dont_track;
++
++      __ cmpq(Address(r15_thread, in_bytes(JavaThread::thingie_offset())), 0);
++      __ jcc(Assembler::greater, dont_track);
++      __ push(atos); // save the return value
++      __ call_VM_leaf(CAST_FROM_FN_PTR(address, MemTrack_trackAllocationAfterDecrement), r15_thread);
++      __ pop(atos);
++      __ bind(dont_track);
++    }
++
+     __ jmp(done);
+   }
+ 
+diff -r 87440ed4e1de src/share/vm/gc_interface/collectedHeap.inline.hpp
+--- a/src/share/vm/gc_interface/collectedHeap.inline.hpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/share/vm/gc_interface/collectedHeap.inline.hpp	Sat Feb 18 22:31:11 2017 +0100
+@@ -35,6 +35,7 @@
+ #include "runtime/thread.inline.hpp"
+ #include "services/lowMemoryDetector.hpp"
+ #include "utilities/copy.hpp"
++#include "prims/piano.hpp"
+ 
+ // Inline allocation implementations.
+ 
+@@ -127,6 +128,9 @@
+     if (result != NULL) {
+       assert(!HAS_PENDING_EXCEPTION,
+              "Unexpected exception, will result in uninitialized storage");
++      if (MemTrack_SampleMemoryAllocationSize > 0) {
++        MemTrack_trackAllocation(THREAD, size * HeapWordSize);
++      }
+       return result;
+     }
+   }
+@@ -139,6 +143,9 @@
+     assert(!HAS_PENDING_EXCEPTION,
+            "Unexpected exception, will result in uninitialized storage");
+     THREAD->incr_allocated_bytes(size * HeapWordSize);
++    if (MemTrack_SampleMemoryAllocationSize > 0) {
++      MemTrack_trackAllocation(THREAD, size * HeapWordSize);
++    }
+ 
+     AllocTracer::send_allocation_outside_tlab_event(klass, size * HeapWordSize);
+ 
+diff -r 87440ed4e1de src/share/vm/interpreter/bytecodeInterpreter.cpp
+--- a/src/share/vm/interpreter/bytecodeInterpreter.cpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/share/vm/interpreter/bytecodeInterpreter.cpp	Sat Feb 18 22:31:11 2017 +0100
+@@ -45,6 +45,7 @@
+ #include "runtime/sharedRuntime.hpp"
+ #include "runtime/threadCritical.hpp"
+ #include "utilities/exceptions.hpp"
++#include "prims/piano.hpp"
+ 
+ // no precompiled headers
+ #ifdef CC_INTERP
+@@ -2213,6 +2214,9 @@
+             }
+ #endif
+             if (result != NULL) {
++              if (MemTrack_SampleMemoryAllocationSize > 0) {
++                MemTrack_trackAllocation(THREAD, obj_size);
++              }
+               // Initialize object (if nonzero size and need) and then the header
+               if (need_zero ) {
+                 HeapWord* to_zero = (HeapWord*) result + sizeof(oopDesc) / oopSize;
+diff -r 87440ed4e1de src/share/vm/opto/macro.cpp
+--- a/src/share/vm/opto/macro.cpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/share/vm/opto/macro.cpp	Sat Feb 18 22:31:11 2017 +0100
+@@ -41,6 +41,7 @@
+ #include "opto/subnode.hpp"
+ #include "opto/type.hpp"
+ #include "runtime/sharedRuntime.hpp"
++#include "prims/piano.hpp"
+ 
+ 
+ //
+@@ -1176,7 +1177,7 @@
+   assert(ctrl != NULL, "must have control");
+   // We need a Region and corresponding Phi's to merge the slow-path and fast-path results.
+   // they will not be used if "always_slow" is set
+-  enum { slow_result_path = 1, fast_result_path = 2 };
++  enum { slow_result_path = 1, fast_result_path = 2, fast_result_path_sampled = 3 };
+   Node *result_region = NULL;
+   Node *result_phi_rawmem = NULL;
+   Node *result_phi_rawoop = NULL;
+@@ -1253,7 +1254,7 @@
+     Node *eden_end = make_load(ctrl, mem, eden_end_adr, 0, TypeRawPtr::BOTTOM, T_ADDRESS);
+ 
+     // allocate the Region and Phi nodes for the result
+-    result_region = new (C) RegionNode(3);
++    result_region = new (C) RegionNode(MemTrack_SampleMemoryAllocationSize > 0 ? 4 : 3);
+     result_phi_rawmem = new (C) PhiNode(result_region, Type::MEMORY, TypeRawPtr::BOTTOM);
+     result_phi_rawoop = new (C) PhiNode(result_region, TypeRawPtr::BOTTOM);
+     result_phi_i_o    = new (C) PhiNode(result_region, Type::ABIO); // I/O is used for Prefetch
+@@ -1460,6 +1461,62 @@
+       transform_later(fast_oop_rawmem);
+     }
+ 
++    if (MemTrack_SampleMemoryAllocationSize > 0) {
++      int thingie_offset = in_bytes(JavaThread::thingie_offset());
++      Node *thread = new (C) ThreadLocalNode();
++      transform_later(thread);
++      Node *thingie_adr = basic_plus_adr(top(), thread, thingie_offset);
++      Node *thingie_value = make_load(fast_oop_ctrl, fast_oop_rawmem, thingie_adr, 0, TypeLong::LONG, T_LONG);
++      // XXX int -> long
++      Node *decrement_counter = new (C) SubLNode(thingie_value, size_in_bytes);
++      transform_later(decrement_counter);
++      Node *save_counter = make_store(fast_oop_ctrl, thingie_value, thingie_adr, 0, decrement_counter, T_LONG);
++
++      Node *compare_counter = new (C) CmpLNode(decrement_counter, longcon(0));
++      transform_later(compare_counter);
++      Node *bool_compare = new (C) BoolNode(compare_counter, BoolTest::le);
++      transform_later(bool_compare);
++      IfNode *sample_iff = new (C) IfNode(fast_oop_ctrl, bool_compare, PROB_STATIC_INFREQUENT, COUNT_UNKNOWN);
++      transform_later(sample_iff);
++      Node *alloc_not_sampled = new (C) IfFalseNode(sample_iff);
++      transform_later(alloc_not_sampled);
++      Node *alloc_sampled = new (C) IfTrueNode(sample_iff);
++      transform_later(alloc_sampled);
++      Node *alloc_sampled_region = new (C) RegionNode (2);
++      transform_later(alloc_sampled_region);
++
++      alloc_sampled_region->init_req(1, alloc_sampled);
++
++      // Slow-path call
++      int size = TypeFunc::Parms + 1;
++      CallLeafNode *call = new (C) CallLeafNode(OptoRuntime::track_alloc_Type(),
++                                                CAST_FROM_FN_PTR(address, MemTrack_trackAllocationAfterDecrement),
++                                                "track_alloc",
++                                                TypeRawPtr::BOTTOM);
++
++      call->init_req(TypeFunc::Parms+0, thread);
++      call->init_req(TypeFunc::Control, alloc_sampled);
++      call->init_req(TypeFunc::I_O    , top()); // does no i/o
++      call->init_req(TypeFunc::Memory , save_counter);
++      call->init_req(TypeFunc::ReturnAdr, alloc->in(TypeFunc::ReturnAdr));
++      call->init_req(TypeFunc::FramePtr, alloc->in(TypeFunc::FramePtr));
++      transform_later(call);
++      Node *call_ctrl = new (C) ProjNode(call,TypeFunc::Control);
++      transform_later(call_ctrl);
++      Node *call_rawmem = new (C) ProjNode(call,TypeFunc::Memory);
++      transform_later(call_rawmem);
++
++      // Plug in the sampled fast-path into the result merge point
++      result_region    ->init_req(fast_result_path_sampled, call_ctrl);
++      result_phi_rawoop->init_req(fast_result_path_sampled, fast_oop);
++      result_phi_i_o   ->init_req(fast_result_path_sampled, i_o);
++      result_phi_rawmem->init_req(fast_result_path_sampled, call_rawmem);
++
++      // And set up for the non-sampled fast-path
++      fast_oop_ctrl = alloc_not_sampled;
++      fast_oop_rawmem = save_counter;
++    }
++
+     // Plug in the successful fast-path into the result merge point
+     result_region    ->init_req(fast_result_path, fast_oop_ctrl);
+     result_phi_rawoop->init_req(fast_result_path, fast_oop);
+diff -r 87440ed4e1de src/share/vm/opto/runtime.cpp
+--- a/src/share/vm/opto/runtime.cpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/share/vm/opto/runtime.cpp	Sat Feb 18 22:31:11 2017 +0100
+@@ -1422,6 +1422,21 @@
+   return TypeFunc::make(domain,range);
+ }
+ 
++const TypeFunc *OptoRuntime::track_alloc_Type() {
++  // create input type (domain)
++  const Type **fields = TypeTuple::fields(1);
++  fields[TypeFunc::Parms+0] = TypeRawPtr::BOTTOM; // Thread
++
++  const TypeTuple *domain = TypeTuple::make(TypeFunc::Parms+1,fields);
++
++  // create result type (range)
++  fields = TypeTuple::fields(0);
++
++  const TypeTuple *range = TypeTuple::make(TypeFunc::Parms+0,fields);
++
++  return TypeFunc::make(domain,range);
++}
++
+ 
+ JRT_ENTRY_NO_ASYNC(void, OptoRuntime::register_finalizer(oopDesc* obj, JavaThread* thread))
+   assert(obj->is_oop(), "must be a valid oop");
+diff -r 87440ed4e1de src/share/vm/opto/runtime.hpp
+--- a/src/share/vm/opto/runtime.hpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/share/vm/opto/runtime.hpp	Sat Feb 18 22:31:11 2017 +0100
+@@ -332,6 +332,7 @@
+   // Dtrace support
+   static const TypeFunc* dtrace_method_entry_exit_Type();
+   static const TypeFunc* dtrace_object_alloc_Type();
++  static const TypeFunc* track_alloc_Type();
+ 
+ # ifdef ENABLE_ZAP_DEAD_LOCALS
+   static const TypeFunc* zap_dead_locals_Type();
+diff -r 87440ed4e1de src/share/vm/prims/piano.cpp
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/share/vm/prims/piano.cpp	Sat Feb 18 22:31:11 2017 +0100
+@@ -0,0 +1,47 @@
++#include "precompiled.hpp"
++#include "piano.hpp"
++
++static MemTrack_userCallback user_callback = NULL;
++jlong MemTrack_SampleMemoryAllocationSize = 0;
++
++class VM_SetMemoryTrackingCounter : public VM_Operation {
++  MemTrack_userCallback callback;
++  jlong sampleSize;
++ public:
++  VM_SetMemoryTrackingCounter(MemTrack_userCallback newCallback, jlong newSampleSize) {
++    callback = newCallback;
++    sampleSize = newSampleSize;
++  }
++  VMOp_Type type()                  const        { return VMOp_SetMemoryTrackingCounter; }
++  bool allow_nested_vm_operations() const        { return true; }
++  void doit() {
++    for (JavaThread* thread = Threads::first(); thread != NULL ; thread = thread->next())
++      thread->allocation_reset_thingie(sampleSize);
++    user_callback = callback;
++    MemTrack_SampleMemoryAllocationSize = sampleSize;
++  }
++};
++
++void MemTrack_setUserCallback(MemTrack_userCallback callback, jlong sampleSize) {
++  if (Threads::first() != NULL) {
++    VM_SetMemoryTrackingCounter vstc(callback, sampleSize);
++    VMThread::execute(&vstc);
++  } else {
++    user_callback = callback;
++    MemTrack_SampleMemoryAllocationSize = sampleSize;
++  }
++}
++
++void MemTrack_trackAllocation(Thread* thread, size_t obj_size) {
++  jlong samples = thread->allocation_tracking_samples(obj_size);
++  if (samples == 0)
++    return;
++  if (user_callback)
++      user_callback(samples);
++}
++
++void MemTrack_trackAllocationAfterDecrement(Thread* thread) {
++  unsigned samples = thread->allocation_tracking_samples(0);
++  if (user_callback)
++      user_callback(samples);
++}
+diff -r 87440ed4e1de src/share/vm/prims/piano.hpp
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/share/vm/prims/piano.hpp	Sat Feb 18 22:31:11 2017 +0100
+@@ -0,0 +1,19 @@
++#ifndef SHARE_VM_PRIMS_PIANO_HPP
++#define SHARE_VM_PRIMS_PIANO_HPP
++
++#include "runtime/thread.hpp"
++
++extern "C" {
++  typedef void (*MemTrack_userCallback)(jlong samples);
++
++  JNIEXPORT
++  void MemTrack_setUserCallback(MemTrack_userCallback callback, jlong sampleSize);
++}
++
++// Called from various places to perform the actual tracking
++void MemTrack_trackAllocation(Thread *thread, size_t size);
++void MemTrack_trackAllocationAfterDecrement(Thread *thread);
++
++extern jlong MemTrack_SampleMemoryAllocationSize;
++
++#endif // SHARE_VM_PRIMS_PIANO_HPP
+diff -r 87440ed4e1de src/share/vm/runtime/thread.cpp
+--- a/src/share/vm/runtime/thread.cpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/share/vm/runtime/thread.cpp	Sat Feb 18 22:31:11 2017 +0100
+@@ -246,6 +246,7 @@
+   NOT_PRODUCT(_skip_gcalot = false;)
+   _jvmti_env_iteration_count = 0;
+   set_allocated_bytes(0);
++  _thingie = MemTrack_SampleMemoryAllocationSize;
+   _vm_operation_started_count = 0;
+   _vm_operation_completed_count = 0;
+   _current_pending_monitor = NULL;
+@@ -4669,6 +4670,19 @@
+   }
+ }
+ 
++jlong Thread::allocation_tracking_samples(size_t size) {
++  _thingie -= size;
++  if (_thingie > 0)
++    return 0;
++  jlong samples = (-_thingie) / MemTrack_SampleMemoryAllocationSize + 1;
++  _thingie += samples * MemTrack_SampleMemoryAllocationSize;
++  return samples;
++}
++
++void Thread::allocation_reset_thingie(jlong thingie) {
++  _thingie = thingie;
++}
++
+ 
+ void Threads::verify() {
+   ALL_JAVA_THREADS(p) {
+diff -r 87440ed4e1de src/share/vm/runtime/thread.hpp
+--- a/src/share/vm/runtime/thread.hpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/share/vm/runtime/thread.hpp	Sat Feb 18 22:31:11 2017 +0100
+@@ -259,6 +259,8 @@
+   jlong _allocated_bytes;                       // Cumulative number of bytes allocated on
+                                                 // the Java heap
+ 
++  jlong _thingie;
++
+   // Thread-local buffer used by MetadataOnStackMark.
+   MetadataOnStackBuffer* _metadata_on_stack_buffer;
+ 
+@@ -603,6 +605,9 @@
+   void leaving_jvmti_env_iteration()             { --_jvmti_env_iteration_count; }
+   bool is_inside_jvmti_env_iteration()           { return _jvmti_env_iteration_count > 0; }
+ 
++  jlong allocation_tracking_samples(size_t size);
++  void allocation_reset_thingie(jlong thingie);
++
+   // Code generation
+   static ByteSize exception_file_offset()        { return byte_offset_of(Thread, _exception_file   ); }
+   static ByteSize exception_line_offset()        { return byte_offset_of(Thread, _exception_line   ); }
+@@ -628,6 +633,8 @@
+ 
+   static ByteSize allocated_bytes_offset()       { return byte_offset_of(Thread, _allocated_bytes ); }
+ 
++  static ByteSize thingie_offset()               { return byte_offset_of(Thread, _thingie ); }
++
+  public:
+   volatile intptr_t _Stalled ;
+   volatile int _TypeTag ;
+diff -r 87440ed4e1de src/share/vm/runtime/vm_operations.hpp
+--- a/src/share/vm/runtime/vm_operations.hpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/share/vm/runtime/vm_operations.hpp	Sat Feb 18 22:31:11 2017 +0100
+@@ -97,6 +97,7 @@
+   template(LinuxDllLoad)                          \
+   template(RotateGCLog)                           \
+   template(WhiteBoxOperation)                     \
++  template(SetMemoryTrackingCounter)              \
+ 
+ class VM_Operation: public CHeapObj<mtInternal> {
+  public:

@@ -1,0 +1,23 @@
+<project>
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>org.barbon.openjdk-memory-profiling</groupId>
+    <artifactId>test-honest-profiler</artifactId>
+    <version>0.0.1</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <maven.compiler.source>1.8</maven.compiler.source>
+        <maven.compiler.target>1.8</maven.compiler.target>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.insightfullogic</groupId>
+            <artifactId>honest-profiler</artifactId>
+            <version>NONE</version>
+            <scope>system</scope>
+            <systemPath>${project.basedir}/../../honest-profiler/target/honest-profiler.jar</systemPath>
+        </dependency>
+    </dependencies>
+</project>

@@ -1,0 +1,5 @@
+/jdk8u
+/honest-profiler
+/test/agent/target
+/test/honest-profiler/target
+/hp-log.hpl

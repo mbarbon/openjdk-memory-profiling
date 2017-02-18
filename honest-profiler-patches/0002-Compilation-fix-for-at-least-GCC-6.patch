@@ -1,0 +1,25 @@
+From 093e5a7fc623637daa5480b1fa7ce30e366305a1 Mon Sep 17 00:00:00 2001
+From: Mattia Barbon <mattia@barbon.org>
+Date: Sun, 19 Feb 2017 12:28:07 +0100
+Subject: [PATCH 2/3] Compilation fix for (at least) GCC 6
+
+---
+ src/test/cpp/test_profiler_config.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/test/cpp/test_profiler_config.cpp b/src/test/cpp/test_profiler_config.cpp
+index 2a6888e..9626777 100644
+--- a/src/test/cpp/test_profiler_config.cpp
++++ b/src/test/cpp/test_profiler_config.cpp
+@@ -194,7 +194,7 @@ TEST_FIXTURE(ProfilerControl, ProfilerConcurrentModification) {
+ 	for (int it = 0; it < 100; it++) {
+ 		profiler->setMaxFramesToCapture(tsize + 1);
+ 		for (int i = 0; i < tsize; i++) {
+-			threads[i] = std::thread(setFoo, std::ref(profiler), i + 1);
++			threads[i] = std::thread(setFoo, profiler, i + 1);
+ 		}
+ 		std::thread starter(&threadStartFunction, std::ref(profiler));
+ 		for (int i = 0; i < tsize; i++)
+-- 
+2.11.1
+

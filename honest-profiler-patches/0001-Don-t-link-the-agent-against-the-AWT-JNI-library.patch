@@ -1,0 +1,32 @@
+From c2d0999e515c20aaf4a5f072948f6ee7e0570518 Mon Sep 17 00:00:00 2001
+From: Mattia Barbon <mattia.barbon@booking.com>
+Date: Thu, 12 Jan 2017 12:00:28 +0100
+Subject: [PATCH 1/3] Don't link the agent against the AWT JNI library
+
+Otherwise it might pull in unneeded dependencies to X11 libraries.
+---
+ CMakeLists.txt | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a2b9567..8b0f317 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -131,11 +131,11 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${GLOBAL_WARNINGS} ${GLOBAL_COPTS} -pthr
+ add_library(${OUTPUT} SHARED ${SOURCE_FILES})
+ 
+ if ("${CMAKE_SYSTEM_NAME}" STREQUAL "FreeBSD") 
+-    target_link_libraries(${OUTPUT} ${JNI_LIBRARIES} rt)
++    target_link_libraries(${OUTPUT} ${JAVA_JVM_LIBRARY} rt)
+ elseif(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+-    target_link_libraries(${OUTPUT} ${JNI_LIBRARIES} dl)
++    target_link_libraries(${OUTPUT} ${JAVA_JVM_LIBRARY} dl)
+ else()
+-    target_link_libraries(${OUTPUT} ${JNI_LIBRARIES} dl rt)
++    target_link_libraries(${OUTPUT} ${JAVA_JVM_LIBRARY} dl rt)
+ endif()
+ 
+ add_executable(unitTests ${UNIT_TEST_H} ${TEST_FILES})
+-- 
+2.11.1
+
