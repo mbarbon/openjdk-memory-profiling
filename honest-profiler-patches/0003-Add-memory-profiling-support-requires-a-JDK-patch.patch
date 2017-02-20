@@ -1,4 +1,4 @@
-From 6a281c94c457b981b9d6c9216f515b09672e04f6 Mon Sep 17 00:00:00 2001
+From aa92c8449e092dd1f2772f928e08b89dbc2fcfb4 Mon Sep 17 00:00:00 2001
 From: Mattia Barbon <mattia@barbon.org>
 Date: Fri, 10 Feb 2017 18:19:09 +0100
 Subject: [PATCH 3/3] Add memory profiling support (requires a JDK patch)
@@ -33,7 +33,11 @@ bytes, a single 3MB allocation counts for 48 samples.
  .../honest_profiler/core/parser/TraceStart.java    |  8 ++-
  .../honest_profiler/core/profiles/FlameTrace.java  |  4 +-
  src/test/cpp/fixtures.h                            |  6 +-
- 20 files changed, 215 insertions(+), 34 deletions(-)
+ .../honest_profiler/core/ConductorTest.java        |  2 +-
+ .../core/collector/FlatProfileTest.java            |  4 +-
+ .../core/collector/LogCollectorTest.java           |  6 +-
+ .../core/collector/ProfileTreeTest.java            |  6 +-
+ 24 files changed, 224 insertions(+), 43 deletions(-)
  create mode 100644 src/main/cpp/memtrace.cpp
  create mode 100644 src/main/cpp/memtrace.h
 
@@ -774,6 +778,100 @@ index d950d6a..47feca6 100644
      CHECK_EQUAL(2, trace.num_frames);
      CHECK_EQUAL((JNIEnv *)envId, trace.env_id);
  
+diff --git a/src/test/java/com/insightfullogic/honest_profiler/core/ConductorTest.java b/src/test/java/com/insightfullogic/honest_profiler/core/ConductorTest.java
+index 76a6b23..1433172 100644
+--- a/src/test/java/com/insightfullogic/honest_profiler/core/ConductorTest.java
++++ b/src/test/java/com/insightfullogic/honest_profiler/core/ConductorTest.java
+@@ -48,7 +48,7 @@ public class ConductorTest
+                 Conductor consumer = new Conductor(logger, Util.log0Source(), parser, false);
+ 
+                 expect.that(consumer.poll()).is(true);
+-                verify(listener).handle(new TraceStart(2, 5, 0, 0));
++                verify(listener).handle(new TraceStart(2, 5, 0, 0, 1));
+ 
+                 expect.that(consumer.poll()).is(true);
+                 verify(listener).handle(new StackFrame(52, 1));
+diff --git a/src/test/java/com/insightfullogic/honest_profiler/core/collector/FlatProfileTest.java b/src/test/java/com/insightfullogic/honest_profiler/core/collector/FlatProfileTest.java
+index 47517ba..206b6b9 100644
+--- a/src/test/java/com/insightfullogic/honest_profiler/core/collector/FlatProfileTest.java
++++ b/src/test/java/com/insightfullogic/honest_profiler/core/collector/FlatProfileTest.java
+@@ -42,7 +42,7 @@ public class FlatProfileTest
+     @Test
+     public void looksUpMethodNames()
+     {
+-        collector.handle(new TraceStart(1, 1, 1, 1));
++        collector.handle(new TraceStart(1, 1, 1, 1, 1));
+         collector.handle(new StackFrame(20, 5));
+         collector.handle(ProfileFixtures.println);
+         collector.endOfLog();
+@@ -66,7 +66,7 @@ public class FlatProfileTest
+     @Test
+     public void calculateMajorityFlatProfiles()
+     {
+-        TraceStart startTrace = new TraceStart(1, 1, 1, 1);
++        TraceStart startTrace = new TraceStart(1, 1, 1, 1, 1);
+         collector.handle(startTrace);
+         collector.handle(new StackFrame(20, 5));
+         collector.handle(ProfileFixtures.println);
+diff --git a/src/test/java/com/insightfullogic/honest_profiler/core/collector/LogCollectorTest.java b/src/test/java/com/insightfullogic/honest_profiler/core/collector/LogCollectorTest.java
+index fe2480b..09ead1d 100644
+--- a/src/test/java/com/insightfullogic/honest_profiler/core/collector/LogCollectorTest.java
++++ b/src/test/java/com/insightfullogic/honest_profiler/core/collector/LogCollectorTest.java
+@@ -51,7 +51,7 @@ public class LogCollectorTest
+         assertTrue("methods don't cause profiles", found.isEmpty());
+ 
+         int threadId = 0;
+-        collector.handle(new TraceStart(2, ++threadId, 1, 1));
++        collector.handle(new TraceStart(2, ++threadId, 1, 1, 1));
+ 
+         assertTrue("nothing to profile still", found.isEmpty());
+ 
+@@ -61,12 +61,12 @@ public class LogCollectorTest
+         collector.handle(new StackFrame(LINE, 2));
+ 
+         // normal method afterwards
+-        collector.handle(new TraceStart(2, ++threadId, 1, 1));
++        collector.handle(new TraceStart(2, ++threadId, 1, 1, 1));
+         collector.handle(new StackFrame(LINE, 6));
+         collector.handle(new StackFrame(LINE, 7));
+ 
+         // and continuation
+-        collector.handle(new TraceStart(20, ++threadId, 1, 1));
++        collector.handle(new TraceStart(20, ++threadId, 1, 1, 1));
+ 
+         assertArrayEquals(new long[]{2, 7}, idOfLastMethodInEachThread(found.getLast()));
+     }
+diff --git a/src/test/java/com/insightfullogic/honest_profiler/core/collector/ProfileTreeTest.java b/src/test/java/com/insightfullogic/honest_profiler/core/collector/ProfileTreeTest.java
+index e639bf3..870c407 100644
+--- a/src/test/java/com/insightfullogic/honest_profiler/core/collector/ProfileTreeTest.java
++++ b/src/test/java/com/insightfullogic/honest_profiler/core/collector/ProfileTreeTest.java
+@@ -43,7 +43,7 @@ public class ProfileTreeTest
+     @Test
+     public void rendersSingleNode()
+     {
+-        collector.handle(new TraceStart(1, 1, 0L, 0L));
++        collector.handle(new TraceStart(1, 1, 0L, 0L, 1L));
+         collector.handle(new StackFrame(20, ProfileFixtures.printlnId));
+         collector.handle(ProfileFixtures.println);
+         collector.endOfLog();
+@@ -126,7 +126,7 @@ public class ProfileTreeTest
+ 
+     private void printlnCallingPrintf(final int threadId)
+     {
+-        collector.handle(new TraceStart(2, threadId, 0, 0));
++        collector.handle(new TraceStart(2, threadId, 0, 0, 1));
+         collector.handle(new StackFrame(20, ProfileFixtures.printfId));
+         collector.handle(ProfileFixtures.printf);
+         collector.handle(new StackFrame(20, ProfileFixtures.printlnId));
+@@ -134,7 +134,7 @@ public class ProfileTreeTest
+ 
+     private void printlnCallingAppend(int threadId)
+     {
+-        collector.handle(new TraceStart(2, threadId, 0, 0));
++        collector.handle(new TraceStart(2, threadId, 0, 0, 1));
+         collector.handle(new StackFrame(20, ProfileFixtures.appendId));
+         collector.handle(ProfileFixtures.append);
+         collector.handle(new StackFrame(20, ProfileFixtures.printlnId));
 -- 
 2.11.1
 

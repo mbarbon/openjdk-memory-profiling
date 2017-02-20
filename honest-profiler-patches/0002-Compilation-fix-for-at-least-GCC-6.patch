@@ -1,4 +1,4 @@
-From 093e5a7fc623637daa5480b1fa7ce30e366305a1 Mon Sep 17 00:00:00 2001
+From 51f4a83a67f004c6805304cf11d31e9592959865 Mon Sep 17 00:00:00 2001
 From: Mattia Barbon <mattia@barbon.org>
 Date: Sun, 19 Feb 2017 12:28:07 +0100
 Subject: [PATCH 2/3] Compilation fix for (at least) GCC 6
