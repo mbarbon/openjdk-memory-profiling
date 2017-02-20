@@ -20,11 +20,11 @@ class OpenJDK(object):
     JVM_C2 = []
     JVM_C2_NOESCAPE = ['-XX:-DoEscapeAnalysis']
 
-    def run_simple_test(self, java_class, extra_args = [], jvm_args = []):
+    def run_simple_test(self, java_class, extra_args=[], jvm_args=[]):
         out = subprocess.check_output([
                 self.JAVA_EXECUTABLE, '-cp', self.TEST_AGENT_CLASSES,
                 '-agentpath:' + self.TEST_AGENT_ARG,
-            ] + jvm_args + [java_class] + extra_args, env = {
+            ] + jvm_args + [java_class] + extra_args, env={
                 'JAVA_HOME': self.JAVA_HOME,
             })
         res = dict((k, v) for (k, v) in
@@ -34,28 +34,28 @@ class OpenJDK(object):
             raise Exception('We gathered samples while profiling was stopped: %d' % res.get('stoppedMemorySamples', -1))
         return res
 
-    def run_honest_profiler_test(self, java_class, extra_args = [], jvm_args = []):
+    def run_honest_profiler_test(self, java_class, extra_args=[], jvm_args=[]):
         out = subprocess.check_output([
                 self.JAVA_EXECUTABLE, '-cp', ':'.join(self.TEST_HONEST_PROFILER_CLASSES),
                 '-agentpath:' + self.HONEST_PROFILER_ARG,
-            ] + jvm_args + [java_class] + extra_args, env = {
+            ] + jvm_args + [java_class] + extra_args, env={
                 'JAVA_HOME': self.JAVA_HOME,
             })
         return out
 
-    def run_class(self, java_class, classpath, extra_args = [], jvm_args = []):
+    def run_class(self, java_class, classpath, extra_args=[], jvm_args=[]):
         out = subprocess.check_output([
                 self.JAVA_EXECUTABLE, '-cp', ':'.join(classpath),
-            ] + jvm_args + [java_class] + extra_args, env = {
+            ] + jvm_args + [java_class] + extra_args, env={
                 'JAVA_HOME': self.JAVA_HOME,
             })
         return out
 
 def _run_sanity_test(ojdk, jvm_args):
-    res1 = ojdk.run_simple_test('omp.SanityTest', extra_args = ['1', '2', '1'], jvm_args = jvm_args)
-    res2 = ojdk.run_simple_test('omp.SanityTest', extra_args = ['1000', '2', '1'], jvm_args = jvm_args)
-    res3 = ojdk.run_simple_test('omp.SanityTest', extra_args = ['1', '100', '1'], jvm_args = jvm_args)
-    res4 = ojdk.run_simple_test('omp.SanityTest', extra_args = ['1000', '100', '1'], jvm_args = jvm_args)
+    res1 = ojdk.run_simple_test('omp.SanityTest', extra_args=['1', '2', '1'], jvm_args=jvm_args)
+    res2 = ojdk.run_simple_test('omp.SanityTest', extra_args=['1000', '2', '1'], jvm_args=jvm_args)
+    res3 = ojdk.run_simple_test('omp.SanityTest', extra_args=['1', '100', '1'], jvm_args=jvm_args)
+    res4 = ojdk.run_simple_test('omp.SanityTest', extra_args=['1000', '100', '1'], jvm_args=jvm_args)
     return [int(res.get('memorySamples')) for res in (res1, res2, res3, res4)]
 
 def run_sanity_test(ojdk):
@@ -80,7 +80,7 @@ def run_sanity_test(ojdk):
     check(c2, 'C2 JIT (with escape anaysis)')
 
 def _run_escape_test(ojdk, iterations, jvm_args):
-    res = ojdk.run_simple_test('omp.EscapeTest', extra_args = [iterations], jvm_args = jvm_args)
+    res = ojdk.run_simple_test('omp.EscapeTest', extra_args=[iterations], jvm_args=jvm_args)
     return int(res.get('memorySamples'))
 
 def run_escape_test(ojdk):
@@ -96,7 +96,7 @@ def run_escape_test(ojdk):
         raise Exception('Unexpected result for C2 JIT (escape analysis): ratio %d is < 30' % (c2_noescape / c2))
 
 def _run_sampling_test(ojdk, size, jvm_args):
-    res = ojdk.run_simple_test('omp.SanityTest', extra_args = ['1000', '100', size], jvm_args = jvm_args)
+    res = ojdk.run_simple_test('omp.SanityTest', extra_args=['1000', '100', size], jvm_args=jvm_args)
     return int(res.get('memorySamples'))
 
 def run_sampling_test(ojdk):
@@ -118,7 +118,7 @@ def run_sampling_test(ojdk):
 def run_honest_profiler_test(ojdk):
     ojdk.run_honest_profiler_test('omp.SanityTest')
 
-    traces = ojdk.run_class('omp.TraceDumper', ojdk.TEST_HONEST_PROFILER_CLASSES, extra_args = ['hp-log.hpl'])
+    traces = ojdk.run_class('omp.TraceDumper', ojdk.TEST_HONEST_PROFILER_CLASSES, extra_args=['hp-log.hpl'])
     main_traces = [line for line in traces.decode('ascii').split('\n')
                        if line.startswith('omp.SanityTest.main:')]
     trace_map = dict(line.split(' ') for line in main_traces)
