@@ -1,15 +1,14 @@
 <project>
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>org.barbon.openjdk-memory-profiling</groupId>
-    <artifactId>test-agent</artifactId>
-    <version>0.0.1</version>
-    <packaging>nar</packaging>
+    <parent>
+        <groupId>org.barbon.openjdk-memory-profiling</groupId>
+        <artifactId>openjdk-memory-profiling-tests</artifactId>
+        <version>0.0.1</version>
+    </parent>
 
-    <properties>
-        <maven.compiler.source>1.8</maven.compiler.source>
-        <maven.compiler.target>1.8</maven.compiler.target>
-    </properties>
+    <artifactId>test-agent</artifactId>
+    <packaging>nar</packaging>
 
     <build>
         <plugins>
