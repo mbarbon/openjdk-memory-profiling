@@ -3,3 +3,5 @@
 /test/agent/target
 /test/honest-profiler/target
 /hp-log.hpl
+/configuration.ini
+*.pyc

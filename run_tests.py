@@ -1,10 +1,13 @@
 #!/usr/bin/env python
 
+import glob
 import subprocess
 import sys
 
-class OpenJDK(object):
-    TEST_AGENT_ARG = 'test/agent/target/nar/test-agent-0.0.1-amd64-Linux-gpp-jni/lib/amd64-Linux-gpp/jni/libtest-agent-0.0.1.so'
+import omp
+
+class OpenJDK(omp.openjdk.OpenJDK):
+    TEST_AGENT_ARG = None
     HONEST_PROFILER_ARG = 'honest-profiler/build/liblagent.so=start=0,memorySampleSize=64,logPath=hp-log.hpl'
     TEST_AGENT_CLASSES = 'test/agent/target/test-agent-0.0.1.jar'
     HONEST_PROFILER_CLASSES = 'honest-profiler/target/honest-profiler.jar'
@@ -12,21 +15,24 @@ class OpenJDK(object):
         HONEST_PROFILER_CLASSES,
         'test/honest-profiler/target/test-honest-profiler-0.0.1.jar',
     ]
-    JAVA_HOME = 'jdk8u/build/linux-x86_64-normal-server-release/jdk'
-    JAVA_EXECUTABLE = JAVA_HOME + '/bin/java'
 
-    JVM_INTERPRETER = ['-Xint']
-    JVM_C1 = ['-XX:TieredStopAtLevel=1']
-    JVM_C2 = []
-    JVM_C2_NOESCAPE = ['-XX:-DoEscapeAnalysis']
+    def find_test_agent(self):
+        if self.TEST_AGENT_ARG:
+            return
+
+        potential = glob.glob('test/agent/target/nar/*/lib/*/jni/libtest-agent-0.0.1.so')
+        if len(potential) != 1:
+            raise Exception("Couldn't find test agent binary")
+        self.TEST_AGENT_ARG = potential[0]
 
     def run_simple_test(self, java_class, extra_args=[], jvm_args=[]):
+        self.find_jdk_build_directory()
+        self.find_test_agent()
+
         out = subprocess.check_output([
-                self.JAVA_EXECUTABLE, '-cp', self.TEST_AGENT_CLASSES,
+                self.java_executable, '-cp', self.TEST_AGENT_CLASSES,
                 '-agentpath:' + self.TEST_AGENT_ARG,
-            ] + jvm_args + [java_class] + extra_args, env={
-                'JAVA_HOME': self.JAVA_HOME,
-            })
+            ] + jvm_args + [java_class] + extra_args, env=ojdk.with_java_home())
         res = dict((k, v) for (k, v) in
                            [l.split(': ', 2)
                                 for l in out.decode('ascii').split('\n') if l])
@@ -36,19 +42,15 @@ class OpenJDK(object):
 
     def run_honest_profiler_test(self, java_class, extra_args=[], jvm_args=[]):
         out = subprocess.check_output([
-                self.JAVA_EXECUTABLE, '-cp', ':'.join(self.TEST_HONEST_PROFILER_CLASSES),
+                self.java_executable, '-cp', ':'.join(self.TEST_HONEST_PROFILER_CLASSES),
                 '-agentpath:' + self.HONEST_PROFILER_ARG,
-            ] + jvm_args + [java_class] + extra_args, env={
-                'JAVA_HOME': self.JAVA_HOME,
-            })
+            ] + jvm_args + [java_class] + extra_args, env=ojdk.with_java_home())
         return out
 
     def run_class(self, java_class, classpath, extra_args=[], jvm_args=[]):
         out = subprocess.check_output([
-                self.JAVA_EXECUTABLE, '-cp', ':'.join(classpath),
-            ] + jvm_args + [java_class] + extra_args, env={
-                'JAVA_HOME': self.JAVA_HOME,
-            })
+                self.java_executable, '-cp', ':'.join(classpath),
+            ] + jvm_args + [java_class] + extra_args, env=ojdk.with_java_home())
         return out
 
 def _run_sanity_test(ojdk, jvm_args):
@@ -132,7 +134,8 @@ def run_honest_profiler_test(ojdk):
         raise Exception('Unexpected result: %d != %d' % (sample_512, sample_1 / 512))
 
 if __name__ == '__main__':
-    ojdk = OpenJDK()
+    conf = omp.configuration.Configuration('configuration.ini')
+    ojdk = OpenJDK(conf)
     print('Running OpenJDK-only tests...')
 
     print('    sanity test...')
