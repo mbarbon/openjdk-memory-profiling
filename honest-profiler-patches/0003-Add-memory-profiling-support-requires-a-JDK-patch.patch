@@ -1,4 +1,4 @@
-From aa92c8449e092dd1f2772f928e08b89dbc2fcfb4 Mon Sep 17 00:00:00 2001
+From 1def016161252869b48818d16d50d9af3726b790 Mon Sep 17 00:00:00 2001
 From: Mattia Barbon <mattia@barbon.org>
 Date: Fri, 10 Feb 2017 18:19:09 +0100
 Subject: [PATCH 3/3] Add memory profiling support (requires a JDK patch)
@@ -21,7 +21,7 @@ bytes, a single 3MB allocation counts for 48 samples.
  src/main/cpp/globals.h                             |  3 +
  src/main/cpp/log_writer.cpp                        | 12 ++--
  src/main/cpp/log_writer.h                          |  8 +--
- src/main/cpp/memtrace.cpp                          | 38 ++++++++++++
+ src/main/cpp/memtrace.cpp                          | 42 +++++++++++++
  src/main/cpp/memtrace.h                            | 10 ++++
  src/main/cpp/processor.cpp                         |  6 +-
  src/main/cpp/processor.h                           |  4 +-
@@ -37,7 +37,7 @@ bytes, a single 3MB allocation counts for 48 samples.
  .../core/collector/FlatProfileTest.java            |  4 +-
  .../core/collector/LogCollectorTest.java           |  6 +-
  .../core/collector/ProfileTreeTest.java            |  6 +-
- 24 files changed, 224 insertions(+), 43 deletions(-)
+ 24 files changed, 228 insertions(+), 43 deletions(-)
  create mode 100644 src/main/cpp/memtrace.cpp
  create mode 100644 src/main/cpp/memtrace.h
 
@@ -318,10 +318,10 @@ index e3e884b..d557555 100644
      // between 32 and 64 bits
 diff --git a/src/main/cpp/memtrace.cpp b/src/main/cpp/memtrace.cpp
 new file mode 100644
-index 0000000..8f8f52e
+index 0000000..f676c10
 --- /dev/null
 +++ b/src/main/cpp/memtrace.cpp
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,42 @@
 +#include <string.h>
 +#include <ucontext.h>
 +
@@ -331,6 +331,10 @@ index 0000000..8f8f52e
 +    typedef void (*MemTrack_userCallback)(jlong samples);
 +    typedef void (*MemTrack_setUserCallbackType)(MemTrack_userCallback callback, jlong sampleSize);
 +}
++
++static const jlong LONG_SAMPLE = sizeof(ssize_t) == 8 ?
++    0x007fffffffffffff :
++            0x7fffffff;
 +
 +static MemTrack_setUserCallbackType SetUserCallback;
 +static int samplingSize;
@@ -348,7 +352,7 @@ index 0000000..8f8f52e
 +        SetUserCallback = Accessors::GetJvmFunction<MemTrack_setUserCallbackType>("MemTrack_setUserCallback");
 +    if (SetUserCallback == NULL)
 +        return false;
-+    SetUserCallback(NULL, 0x007fffffffffffff);
++    SetUserCallback(NULL, LONG_SAMPLE);
 +    samplingSize = memorySampleSize;
 +    return true;
 +}
@@ -358,7 +362,7 @@ index 0000000..8f8f52e
 +}
 +
 +void StopMemoryProfiling() {
-+    SetUserCallback(NULL, 0x007fffffffffffff);
++    SetUserCallback(NULL, LONG_SAMPLE);
 +}
 diff --git a/src/main/cpp/memtrace.h b/src/main/cpp/memtrace.h
 new file mode 100644
@@ -873,5 +877,5 @@ index e639bf3..870c407 100644
          collector.handle(ProfileFixtures.append);
          collector.handle(new StackFrame(20, ProfileFixtures.printlnId));
 -- 
-2.11.1
+2.9.3
 

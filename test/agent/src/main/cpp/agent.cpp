@@ -3,7 +3,9 @@
 #include <jvmti.h>
 #include <dlfcn.h>
 
-static const jlong LONG_SAMPLE = 0x007fffffffffffff;
+static const jlong LONG_SAMPLE = sizeof(ssize_t) == 8 ?
+    0x007fffffffffffff :
+            0x7fffffff;
 
 typedef void (*MemTrack_userCallback)(jlong samples);
 typedef void (*MemTrack_setUserCallback_t)(MemTrack_userCallback callback, jlong sampleSize);
