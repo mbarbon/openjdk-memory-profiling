@@ -13,7 +13,7 @@ def build_openjdk(conf):
     jdkdir = conf.jdk_directory()
     _configure_openjdk(jdkdir, 'gcc-5', 'g++-5', conf.bits)
     subprocess.check_call(['make', 'clean'], cwd=jdkdir)
-    subprocess.check_call(['make', 'EXTRA_CFLAGS=-Wno-error'], cwd=jdkdir)
+    subprocess.check_call(['make', 'EXTRA_CFLAGS=-Wno-error -Wno-deprecated-declarations'], cwd=jdkdir)
 
 def build_honest_profiler(ojdk):
     ojdk.find_jdk_build_directory()
