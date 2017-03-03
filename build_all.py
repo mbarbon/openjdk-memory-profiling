@@ -22,7 +22,9 @@ def build_honest_profiler(ojdk):
     subprocess.check_call(['mvn', 'package', '-DskipTests=true'], cwd='honest-profiler')
 
 def build_tests(ojdk):
-    subprocess.check_call(['mvn', 'package', '-DskipTests=true'], cwd='test')
+    ojdk.find_jdk_build_directory()
+
+    subprocess.check_call(['mvn', 'package', '-DskipTests=true'], cwd='test', env=ojdk.with_java_home())
 
 if __name__ == '__main__':
     conf = omp.configuration.Configuration('configuration.ini')

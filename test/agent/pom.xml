@@ -18,7 +18,6 @@
                 <version>3.5.1</version>
                 <extensions>true</extensions>
                 <configuration>
-                    <javaHome>../../jdk8u/build/linux-x86_64-normal-server-release/jdk</javaHome>
                     <cpp>
                         <debug>true</debug>
                     </cpp>
