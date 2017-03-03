@@ -48,8 +48,8 @@ def reset_openjdk(jdkv, jdku, jdkb):
     _hgforest('jdk8u', ['purge'])
     _hg('jdk8u/hotspot', ['qpush', patch])
     if not os.path.exists('jdk8u/hotspot/.hg/patches'):
-        os.path.symlink(os.path.abspath('hotspot-patches'),
-                            'jdk8u/hotspot/.hg/patches')
+        os.symlink(os.path.abspath('hotspot-patches'),
+                   'jdk8u/hotspot/.hg/patches')
 
 def reset_honest_profiler(base_revision):
     _git('honest-profiler', ['reset', '--hard', base_revision])
