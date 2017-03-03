@@ -89,13 +89,18 @@ def run_escape_test(ojdk):
     c2_noescape = _run_escape_test(ojdk, '100000000', ojdk.JVM_C2_NOESCAPE)
     c2 = _run_escape_test(ojdk, '100000000', ojdk.JVM_C2)
 
-    # 32 is the size of the iterator
-    if int(c2_noescape / 100000000) != 32:
-        raise Exception('Unexpected result for C2 JIT (no escape analysis): ratio %d != 32' % (c2_noescape / 100000000))
+    # 24/32 is the size of the iterator
+    if ojdk.conf.bits == 64:
+        iterator_size = 32
+    else:
+        iterator_size = 24
+
+    if int(c2_noescape / 100000000) != iterator_size:
+        raise Exception('Unexpected result for C2 JIT (no escape analysis): ratio %.02f != %d' % ((c2_noescape / 100000000.), iterator_size))
     # things still allocate memory even if the test loop does not: check
     # that we don't allocate that much
-    if c2_noescape / c2 < 30:
-        raise Exception('Unexpected result for C2 JIT (escape analysis): ratio %d is < 30' % (c2_noescape / c2))
+    if c2_noescape / c2 < (iterator_size - 2):
+        raise Exception('Unexpected result for C2 JIT (escape analysis): ratio %.02f is < %d' % ((c2_noescape / float(c2)), (iterator_size - 2)))
 
 def _run_sampling_test(ojdk, size, jvm_args):
     res = ojdk.run_simple_test('omp.SanityTest', extra_args=['1000', '100', size], jvm_args=jvm_args)
@@ -140,7 +145,7 @@ if __name__ == '__main__':
 
     print('    sanity test...')
     run_sanity_test(ojdk)
-    print('    escape anaysis test...')
+    print('    escape analysis test...')
     run_escape_test(ojdk)
     print('    sampling size test...')
     run_sampling_test(ojdk)
