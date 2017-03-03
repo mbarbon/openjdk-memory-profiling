@@ -10,6 +10,10 @@
     <artifactId>test-agent</artifactId>
     <packaging>nar</packaging>
 
+    <properties>
+        <jdk.bits.flags></jdk.bits.flags>
+    </properties>
+
     <build>
         <plugins>
             <plugin>
@@ -20,7 +24,15 @@
                 <configuration>
                     <cpp>
                         <debug>true</debug>
+                        <options>
+                            <option>${jdk.bits.flags}</option>
+                        </options>
                     </cpp>
+                    <linker>
+                        <options>
+                            <option>${jdk.bits.flags}</option>
+                        </options>
+                    </linker>
                     <libraries>
                         <library>
                             <type>jni</type>
