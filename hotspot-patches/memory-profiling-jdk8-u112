@@ -3,7 +3,7 @@
 
 diff -r 87440ed4e1de make/linux/makefiles/mapfile-vers-debug
 --- a/make/linux/makefiles/mapfile-vers-debug	Mon Oct 03 08:13:41 2016 -0700
-+++ b/make/linux/makefiles/mapfile-vers-debug	Sat Feb 18 22:31:11 2017 +0100
++++ b/make/linux/makefiles/mapfile-vers-debug	Fri Mar 03 15:25:55 2017 +0100
 @@ -270,6 +270,9 @@
                  # This is for Forte Analyzer profiling support.
                  AsyncGetCallTrace;
@@ -16,7 +16,7 @@ diff -r 87440ed4e1de make/linux/makefiles/mapfile-vers-debug
          local:
 diff -r 87440ed4e1de make/linux/makefiles/mapfile-vers-product
 --- a/make/linux/makefiles/mapfile-vers-product	Mon Oct 03 08:13:41 2016 -0700
-+++ b/make/linux/makefiles/mapfile-vers-product	Sat Feb 18 22:31:11 2017 +0100
++++ b/make/linux/makefiles/mapfile-vers-product	Fri Mar 03 15:25:55 2017 +0100
 @@ -265,6 +265,9 @@
                  # This is for Forte Analyzer profiling support.
                  AsyncGetCallTrace;
@@ -29,55 +29,118 @@ diff -r 87440ed4e1de make/linux/makefiles/mapfile-vers-product
          local:
 diff -r 87440ed4e1de src/cpu/x86/vm/macroAssembler_x86.cpp
 --- a/src/cpu/x86/vm/macroAssembler_x86.cpp	Mon Oct 03 08:13:41 2016 -0700
-+++ b/src/cpu/x86/vm/macroAssembler_x86.cpp	Sat Feb 18 22:31:11 2017 +0100
-@@ -2987,6 +2987,23 @@
++++ b/src/cpu/x86/vm/macroAssembler_x86.cpp	Fri Mar 03 15:25:55 2017 +0100
+@@ -2987,6 +2987,14 @@
      // it otherwise. Use lock prefix for atomicity on MPs.
      locked_cmpxchgptr(end, heap_top);
      jcc(Assembler::notEqual, retry);
 +
 +    if (MemTrack_SampleMemoryAllocationSize > 0) {
-+      Label dont_track;
 +      Register thread = NOT_LP64(t1) LP64_ONLY(r15_thread);
 +
 +      NOT_LP64(get_thread(thread));
 +
-+      if (var_size_in_bytes == noreg) {
-+        subq(Address(thread, in_bytes(JavaThread::thingie_offset())), con_size_in_bytes);
-+      } else {
-+        subq(Address(thread, in_bytes(JavaThread::thingie_offset())), var_size_in_bytes);
-+      }
-+
-+      jcc(Assembler::positive, dont_track);
-+      call(RuntimeAddress(StubRoutines::x86::track_memory_sample()));
-+      bind(dont_track);
++      track_allocated_bytes(thread, var_size_in_bytes, con_size_in_bytes);
 +    }
    }
  }
  
-@@ -4441,6 +4458,20 @@
+@@ -4441,6 +4449,10 @@
      subptr(var_size_in_bytes, obj);
    }
    verify_tlab();
 +
 +  if (MemTrack_SampleMemoryAllocationSize > 0) {
-+    Label dont_track;
-+
-+    if (var_size_in_bytes == noreg) {
-+      subq(Address(thread, in_bytes(JavaThread::thingie_offset())), con_size_in_bytes);
-+    } else {
-+      subq(Address(thread, in_bytes(JavaThread::thingie_offset())), var_size_in_bytes);
-+    }
-+
-+    jcc(Assembler::positive, dont_track);
-+    call(RuntimeAddress(StubRoutines::x86::track_memory_sample()));
-+    bind(dont_track);
++    track_allocated_bytes(thread, var_size_in_bytes, con_size_in_bytes);
 +  }
  }
  
  // Preserves rbx, and rdx.
+@@ -4580,6 +4592,30 @@
+ #endif
+ }
+ 
++void MacroAssembler::track_allocated_bytes(Register thread,
++                                           Register var_size_in_bytes,
++                                           int con_size_in_bytes) {
++  Label dont_track;
++
++#ifdef _LP64
++  if (var_size_in_bytes == noreg) {
++    subq(Address(thread, in_bytes(JavaThread::thingie_offset())), con_size_in_bytes);
++  } else {
++    subq(Address(thread, in_bytes(JavaThread::thingie_offset())), var_size_in_bytes);
++  }
++#else
++  if (var_size_in_bytes == noreg) {
++    subl(Address(thread, in_bytes(JavaThread::thingie_offset())), con_size_in_bytes);
++  } else {
++    subl(Address(thread, in_bytes(JavaThread::thingie_offset())), var_size_in_bytes);
++  }
++#endif
++
++  jcc(Assembler::positive, dont_track);
++  call(RuntimeAddress(StubRoutines::x86::track_memory_sample()));
++  bind(dont_track);
++}
++
+ void MacroAssembler::fp_runtime_fallback(address runtime_entry, int nb_args, int num_fpu_regs_in_use) {
+   pusha();
+ 
+diff -r 87440ed4e1de src/cpu/x86/vm/macroAssembler_x86.hpp
+--- a/src/cpu/x86/vm/macroAssembler_x86.hpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/cpu/x86/vm/macroAssembler_x86.hpp	Fri Mar 03 15:25:55 2017 +0100
+@@ -518,6 +518,9 @@
+   void incr_allocated_bytes(Register thread,
+                             Register var_size_in_bytes, int con_size_in_bytes,
+                             Register t1 = noreg);
++  void track_allocated_bytes(Register thread,
++                             Register var_size_in_bytes,
++                             int con_size_in_bytes);
+ 
+   // interface method calling
+   void lookup_interface_method(Register recv_klass,
+diff -r 87440ed4e1de src/cpu/x86/vm/stubGenerator_x86_32.cpp
+--- a/src/cpu/x86/vm/stubGenerator_x86_32.cpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/cpu/x86/vm/stubGenerator_x86_32.cpp	Fri Mar 03 15:25:55 2017 +0100
+@@ -510,6 +510,25 @@
+     return start;
+   }
+ 
++  address generate_track_memory_sample() {
++    StubCodeMark mark(this, "StubRoutines", "track_memory_sample");
++    address start = __ pc();
++
++    if (false && MemTrack_SampleMemoryAllocationSize > 0) {
++      __ enter();
++      __ push_CPU_state();
++      __ get_thread(rax);
++      __ push(rax);
++      __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, MemTrack_trackAllocationAfterDecrement)));
++      __ addl(rsp, 4);
++      __ pop_CPU_state();
++      __ leave();
++    }
++
++    __ ret(0);
++
++    return start;
++  }
+ 
+   //---------------------------------------------------------------------------
+   // Support for void verify_fpu_cntrl_wrd()
+@@ -3018,6 +3037,8 @@
+       StubRoutines::_cipherBlockChaining_decryptAESCrypt = generate_cipherBlockChaining_decryptAESCrypt();
+     }
+ 
++    StubRoutines::x86::_track_memory_sample = generate_track_memory_sample();
++
+     // Safefetch stubs.
+     generate_safefetch("SafeFetch32", sizeof(int), &StubRoutines::_safefetch32_entry,
+                                                    &StubRoutines::_safefetch32_fault_pc,
 diff -r 87440ed4e1de src/cpu/x86/vm/stubGenerator_x86_64.cpp
 --- a/src/cpu/x86/vm/stubGenerator_x86_64.cpp	Mon Oct 03 08:13:41 2016 -0700
-+++ b/src/cpu/x86/vm/stubGenerator_x86_64.cpp	Sat Feb 18 22:31:11 2017 +0100
++++ b/src/cpu/x86/vm/stubGenerator_x86_64.cpp	Fri Mar 03 15:25:55 2017 +0100
 @@ -42,6 +42,7 @@
  #ifdef COMPILER2
  #include "opto/runtime.hpp"
@@ -123,7 +186,7 @@ diff -r 87440ed4e1de src/cpu/x86/vm/stubGenerator_x86_64.cpp
                                                         &StubRoutines::_safefetch32_fault_pc,
 diff -r 87440ed4e1de src/cpu/x86/vm/stubRoutines_x86.cpp
 --- a/src/cpu/x86/vm/stubRoutines_x86.cpp	Mon Oct 03 08:13:41 2016 -0700
-+++ b/src/cpu/x86/vm/stubRoutines_x86.cpp	Sat Feb 18 22:31:11 2017 +0100
++++ b/src/cpu/x86/vm/stubRoutines_x86.cpp	Fri Mar 03 15:25:55 2017 +0100
 @@ -32,6 +32,7 @@
  // a description of how to extend it, see the stubRoutines.hpp file.
  
@@ -134,7 +197,7 @@ diff -r 87440ed4e1de src/cpu/x86/vm/stubRoutines_x86.cpp
  uint64_t StubRoutines::x86::_crc_by128_masks[] =
 diff -r 87440ed4e1de src/cpu/x86/vm/stubRoutines_x86.hpp
 --- a/src/cpu/x86/vm/stubRoutines_x86.hpp	Mon Oct 03 08:13:41 2016 -0700
-+++ b/src/cpu/x86/vm/stubRoutines_x86.hpp	Sat Feb 18 22:31:11 2017 +0100
++++ b/src/cpu/x86/vm/stubRoutines_x86.hpp	Fri Mar 03 15:25:55 2017 +0100
 @@ -33,6 +33,7 @@
    static address _verify_mxcsr_entry;
    // shuffle mask for fixing up 128-bit words consisting of big-endian 32-bit integers
@@ -151,9 +214,69 @@ diff -r 87440ed4e1de src/cpu/x86/vm/stubRoutines_x86.hpp
    static address crc_by128_masks_addr()  { return (address)_crc_by128_masks; }
  
  #endif // CPU_X86_VM_STUBROUTINES_X86_32_HPP
+diff -r 87440ed4e1de src/cpu/x86/vm/templateTable_x86_32.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_32.cpp	Mon Oct 03 08:13:41 2016 -0700
++++ b/src/cpu/x86/vm/templateTable_x86_32.cpp	Fri Mar 03 15:25:55 2017 +0100
+@@ -3301,6 +3301,13 @@
+     __ cmpptr(rbx, Address(thread, in_bytes(JavaThread::tlab_end_offset())));
+     __ jcc(Assembler::above, allow_shared_alloc ? allocate_shared : slow_case);
+     __ movptr(Address(thread, in_bytes(JavaThread::tlab_top_offset())), rbx);
++
++    if (MemTrack_SampleMemoryAllocationSize > 0) {
++      __ subl(Address(thread, in_bytes(JavaThread::thingie_offset())), rdx);
++      // save thread for later use
++      __ movl(rbx, thread);
++    }
++
+     if (ZeroTLAB) {
+       // the fields have been already cleared
+       __ jmp(initialize_header);
+@@ -3338,6 +3345,11 @@
+     __ jcc(Assembler::notEqual, retry);
+ 
+     __ incr_allocated_bytes(thread, rdx, 0);
++    if (MemTrack_SampleMemoryAllocationSize > 0) {
++      __ subl(Address(thread, in_bytes(JavaThread::thingie_offset())), rdx);
++      // save thread for later use
++      __ movl(rbx, thread);
++    }
+   }
+ 
+   if (UseTLAB || Universe::heap()->supports_inline_contig_alloc()) {
+@@ -3376,8 +3388,8 @@
+     __ bind(initialize_header);
+     if (UseBiasedLocking) {
+       __ pop(rcx);   // get saved klass back in the register.
+-      __ movptr(rbx, Address(rcx, Klass::prototype_header_offset()));
+-      __ movptr(Address(rax, oopDesc::mark_offset_in_bytes ()), rbx);
++      __ movptr(rdx, Address(rcx, Klass::prototype_header_offset()));
++      __ movptr(Address(rax, oopDesc::mark_offset_in_bytes ()), rdx);
+     } else {
+       __ movptr(Address(rax, oopDesc::mark_offset_in_bytes ()),
+                 (int32_t)markOopDesc::prototype()); // header
+@@ -3385,6 +3397,19 @@
+     }
+     __ store_klass(rax, rcx);  // klass
+ 
++
++    if (MemTrack_SampleMemoryAllocationSize > 0) {
++      Label dont_track;
++      const Register thread = rbx;
++
++      __ cmpl(Address(thread, in_bytes(JavaThread::thingie_offset())), 0);
++      __ jcc(Assembler::greater, dont_track);
++      __ push(atos); // save the return value
++      __ call_VM_leaf(CAST_FROM_FN_PTR(address, MemTrack_trackAllocationAfterDecrement), thread);
++      __ pop(atos);
++      __ bind(dont_track);
++    }
++
+     {
+       SkipIfEqual skip_if(_masm, &DTraceAllocProbes, 0);
+       // Trigger dtrace event for fastpath
 diff -r 87440ed4e1de src/cpu/x86/vm/templateTable_x86_64.cpp
 --- a/src/cpu/x86/vm/templateTable_x86_64.cpp	Mon Oct 03 08:13:41 2016 -0700
-+++ b/src/cpu/x86/vm/templateTable_x86_64.cpp	Sat Feb 18 22:31:11 2017 +0100
++++ b/src/cpu/x86/vm/templateTable_x86_64.cpp	Fri Mar 03 15:25:55 2017 +0100
 @@ -36,6 +36,7 @@
  #include "runtime/stubRoutines.hpp"
  #include "runtime/synchronizer.hpp"
@@ -183,11 +306,10 @@ diff -r 87440ed4e1de src/cpu/x86/vm/templateTable_x86_64.cpp
    }
  
    if (UseTLAB || Universe::heap()->supports_inline_contig_alloc()) {
-@@ -3443,6 +3451,18 @@
-       __ pop(atos); // restore the return value
+@@ -3434,6 +3442,17 @@
+     __ store_klass_gap(rax, rcx);  // zero klass gap for compressed oops
+     __ store_klass(rax, rsi);      // store klass last
  
-     }
-+
 +    if (MemTrack_SampleMemoryAllocationSize > 0) {
 +      Label dont_track;
 +
@@ -199,12 +321,20 @@ diff -r 87440ed4e1de src/cpu/x86/vm/templateTable_x86_64.cpp
 +      __ bind(dont_track);
 +    }
 +
+     {
+       SkipIfEqual skip(_masm, &DTraceAllocProbes, false);
+       // Trigger dtrace event for fastpath
+@@ -3443,6 +3462,7 @@
+       __ pop(atos); // restore the return value
+ 
+     }
++
      __ jmp(done);
    }
  
 diff -r 87440ed4e1de src/share/vm/gc_interface/collectedHeap.inline.hpp
 --- a/src/share/vm/gc_interface/collectedHeap.inline.hpp	Mon Oct 03 08:13:41 2016 -0700
-+++ b/src/share/vm/gc_interface/collectedHeap.inline.hpp	Sat Feb 18 22:31:11 2017 +0100
++++ b/src/share/vm/gc_interface/collectedHeap.inline.hpp	Fri Mar 03 15:25:55 2017 +0100
 @@ -35,6 +35,7 @@
  #include "runtime/thread.inline.hpp"
  #include "services/lowMemoryDetector.hpp"
@@ -235,7 +365,7 @@ diff -r 87440ed4e1de src/share/vm/gc_interface/collectedHeap.inline.hpp
  
 diff -r 87440ed4e1de src/share/vm/interpreter/bytecodeInterpreter.cpp
 --- a/src/share/vm/interpreter/bytecodeInterpreter.cpp	Mon Oct 03 08:13:41 2016 -0700
-+++ b/src/share/vm/interpreter/bytecodeInterpreter.cpp	Sat Feb 18 22:31:11 2017 +0100
++++ b/src/share/vm/interpreter/bytecodeInterpreter.cpp	Fri Mar 03 15:25:55 2017 +0100
 @@ -45,6 +45,7 @@
  #include "runtime/sharedRuntime.hpp"
  #include "runtime/threadCritical.hpp"
@@ -256,7 +386,7 @@ diff -r 87440ed4e1de src/share/vm/interpreter/bytecodeInterpreter.cpp
                  HeapWord* to_zero = (HeapWord*) result + sizeof(oopDesc) / oopSize;
 diff -r 87440ed4e1de src/share/vm/opto/macro.cpp
 --- a/src/share/vm/opto/macro.cpp	Mon Oct 03 08:13:41 2016 -0700
-+++ b/src/share/vm/opto/macro.cpp	Sat Feb 18 22:31:11 2017 +0100
++++ b/src/share/vm/opto/macro.cpp	Fri Mar 03 15:25:55 2017 +0100
 @@ -41,6 +41,7 @@
  #include "opto/subnode.hpp"
  #include "opto/type.hpp"
@@ -283,22 +413,36 @@ diff -r 87440ed4e1de src/share/vm/opto/macro.cpp
      result_phi_rawmem = new (C) PhiNode(result_region, Type::MEMORY, TypeRawPtr::BOTTOM);
      result_phi_rawoop = new (C) PhiNode(result_region, TypeRawPtr::BOTTOM);
      result_phi_i_o    = new (C) PhiNode(result_region, Type::ABIO); // I/O is used for Prefetch
-@@ -1460,6 +1461,62 @@
+@@ -1460,6 +1461,76 @@
        transform_later(fast_oop_rawmem);
      }
  
 +    if (MemTrack_SampleMemoryAllocationSize > 0) {
++#ifdef _LP64
++      const Type* value_type = TypeLong::LONG;
++      const BasicType basic_type = T_LONG;
++#else
++      const Type* value_type = TypeInt::INT;
++      const BasicType basic_type = T_INT;
++#endif
 +      int thingie_offset = in_bytes(JavaThread::thingie_offset());
 +      Node *thread = new (C) ThreadLocalNode();
 +      transform_later(thread);
 +      Node *thingie_adr = basic_plus_adr(top(), thread, thingie_offset);
-+      Node *thingie_value = make_load(fast_oop_ctrl, fast_oop_rawmem, thingie_adr, 0, TypeLong::LONG, T_LONG);
-+      // XXX int -> long
++      Node *thingie_value = make_load(fast_oop_ctrl, fast_oop_rawmem, thingie_adr, 0, value_type, basic_type);
++#ifdef _LP64
 +      Node *decrement_counter = new (C) SubLNode(thingie_value, size_in_bytes);
++#else
++      Node *decrement_counter = new (C) SubINode(thingie_value, size_in_bytes);
++#endif
 +      transform_later(decrement_counter);
-+      Node *save_counter = make_store(fast_oop_ctrl, thingie_value, thingie_adr, 0, decrement_counter, T_LONG);
++      Node *save_counter = make_store(fast_oop_ctrl, thingie_value, thingie_adr, 0, decrement_counter, basic_type);
 +
++#ifdef _LP64
 +      Node *compare_counter = new (C) CmpLNode(decrement_counter, longcon(0));
++#else
++      Node *compare_counter = new (C) CmpINode(decrement_counter, intcon(0));
++#endif
 +      transform_later(compare_counter);
 +      Node *bool_compare = new (C) BoolNode(compare_counter, BoolTest::le);
 +      transform_later(bool_compare);
@@ -348,7 +492,7 @@ diff -r 87440ed4e1de src/share/vm/opto/macro.cpp
      result_phi_rawoop->init_req(fast_result_path, fast_oop);
 diff -r 87440ed4e1de src/share/vm/opto/runtime.cpp
 --- a/src/share/vm/opto/runtime.cpp	Mon Oct 03 08:13:41 2016 -0700
-+++ b/src/share/vm/opto/runtime.cpp	Sat Feb 18 22:31:11 2017 +0100
++++ b/src/share/vm/opto/runtime.cpp	Fri Mar 03 15:25:55 2017 +0100
 @@ -1422,6 +1422,21 @@
    return TypeFunc::make(domain,range);
  }
@@ -373,7 +517,7 @@ diff -r 87440ed4e1de src/share/vm/opto/runtime.cpp
    assert(obj->is_oop(), "must be a valid oop");
 diff -r 87440ed4e1de src/share/vm/opto/runtime.hpp
 --- a/src/share/vm/opto/runtime.hpp	Mon Oct 03 08:13:41 2016 -0700
-+++ b/src/share/vm/opto/runtime.hpp	Sat Feb 18 22:31:11 2017 +0100
++++ b/src/share/vm/opto/runtime.hpp	Fri Mar 03 15:25:55 2017 +0100
 @@ -332,6 +332,7 @@
    // Dtrace support
    static const TypeFunc* dtrace_method_entry_exit_Type();
@@ -384,13 +528,13 @@ diff -r 87440ed4e1de src/share/vm/opto/runtime.hpp
    static const TypeFunc* zap_dead_locals_Type();
 diff -r 87440ed4e1de src/share/vm/prims/piano.cpp
 --- /dev/null	Thu Jan 01 00:00:00 1970 +0000
-+++ b/src/share/vm/prims/piano.cpp	Sat Feb 18 22:31:11 2017 +0100
++++ b/src/share/vm/prims/piano.cpp	Fri Mar 03 15:25:55 2017 +0100
 @@ -0,0 +1,47 @@
 +#include "precompiled.hpp"
 +#include "piano.hpp"
 +
 +static MemTrack_userCallback user_callback = NULL;
-+jlong MemTrack_SampleMemoryAllocationSize = 0;
++ssize_t MemTrack_SampleMemoryAllocationSize = 0;
 +
 +class VM_SetMemoryTrackingCounter : public VM_Operation {
 +  MemTrack_userCallback callback;
@@ -421,21 +565,21 @@ diff -r 87440ed4e1de src/share/vm/prims/piano.cpp
 +}
 +
 +void MemTrack_trackAllocation(Thread* thread, size_t obj_size) {
-+  jlong samples = thread->allocation_tracking_samples(obj_size);
++  ssize_t samples = thread->allocation_tracking_samples(obj_size);
 +  if (samples == 0)
 +    return;
 +  if (user_callback)
-+      user_callback(samples);
++    user_callback(samples);
 +}
 +
 +void MemTrack_trackAllocationAfterDecrement(Thread* thread) {
 +  unsigned samples = thread->allocation_tracking_samples(0);
 +  if (user_callback)
-+      user_callback(samples);
++    user_callback(samples);
 +}
 diff -r 87440ed4e1de src/share/vm/prims/piano.hpp
 --- /dev/null	Thu Jan 01 00:00:00 1970 +0000
-+++ b/src/share/vm/prims/piano.hpp	Sat Feb 18 22:31:11 2017 +0100
++++ b/src/share/vm/prims/piano.hpp	Fri Mar 03 15:25:55 2017 +0100
 @@ -0,0 +1,19 @@
 +#ifndef SHARE_VM_PRIMS_PIANO_HPP
 +#define SHARE_VM_PRIMS_PIANO_HPP
@@ -453,12 +597,12 @@ diff -r 87440ed4e1de src/share/vm/prims/piano.hpp
 +void MemTrack_trackAllocation(Thread *thread, size_t size);
 +void MemTrack_trackAllocationAfterDecrement(Thread *thread);
 +
-+extern jlong MemTrack_SampleMemoryAllocationSize;
++extern ssize_t MemTrack_SampleMemoryAllocationSize;
 +
 +#endif // SHARE_VM_PRIMS_PIANO_HPP
 diff -r 87440ed4e1de src/share/vm/runtime/thread.cpp
 --- a/src/share/vm/runtime/thread.cpp	Mon Oct 03 08:13:41 2016 -0700
-+++ b/src/share/vm/runtime/thread.cpp	Sat Feb 18 22:31:11 2017 +0100
++++ b/src/share/vm/runtime/thread.cpp	Fri Mar 03 15:25:55 2017 +0100
 @@ -246,6 +246,7 @@
    NOT_PRODUCT(_skip_gcalot = false;)
    _jvmti_env_iteration_count = 0;
@@ -471,16 +615,16 @@ diff -r 87440ed4e1de src/share/vm/runtime/thread.cpp
    }
  }
  
-+jlong Thread::allocation_tracking_samples(size_t size) {
++ssize_t Thread::allocation_tracking_samples(size_t size) {
 +  _thingie -= size;
 +  if (_thingie > 0)
 +    return 0;
-+  jlong samples = (-_thingie) / MemTrack_SampleMemoryAllocationSize + 1;
++  ssize_t samples = (-_thingie) / MemTrack_SampleMemoryAllocationSize + 1;
 +  _thingie += samples * MemTrack_SampleMemoryAllocationSize;
 +  return samples;
 +}
 +
-+void Thread::allocation_reset_thingie(jlong thingie) {
++void Thread::allocation_reset_thingie(ssize_t thingie) {
 +  _thingie = thingie;
 +}
 +
@@ -489,12 +633,12 @@ diff -r 87440ed4e1de src/share/vm/runtime/thread.cpp
    ALL_JAVA_THREADS(p) {
 diff -r 87440ed4e1de src/share/vm/runtime/thread.hpp
 --- a/src/share/vm/runtime/thread.hpp	Mon Oct 03 08:13:41 2016 -0700
-+++ b/src/share/vm/runtime/thread.hpp	Sat Feb 18 22:31:11 2017 +0100
++++ b/src/share/vm/runtime/thread.hpp	Fri Mar 03 15:25:55 2017 +0100
 @@ -259,6 +259,8 @@
    jlong _allocated_bytes;                       // Cumulative number of bytes allocated on
                                                  // the Java heap
  
-+  jlong _thingie;
++  ssize_t _thingie;
 +
    // Thread-local buffer used by MetadataOnStackMark.
    MetadataOnStackBuffer* _metadata_on_stack_buffer;
@@ -503,8 +647,8 @@ diff -r 87440ed4e1de src/share/vm/runtime/thread.hpp
    void leaving_jvmti_env_iteration()             { --_jvmti_env_iteration_count; }
    bool is_inside_jvmti_env_iteration()           { return _jvmti_env_iteration_count > 0; }
  
-+  jlong allocation_tracking_samples(size_t size);
-+  void allocation_reset_thingie(jlong thingie);
++  ssize_t allocation_tracking_samples(size_t size);
++  void allocation_reset_thingie(ssize_t thingie);
 +
    // Code generation
    static ByteSize exception_file_offset()        { return byte_offset_of(Thread, _exception_file   ); }
@@ -520,7 +664,7 @@ diff -r 87440ed4e1de src/share/vm/runtime/thread.hpp
    volatile int _TypeTag ;
 diff -r 87440ed4e1de src/share/vm/runtime/vm_operations.hpp
 --- a/src/share/vm/runtime/vm_operations.hpp	Mon Oct 03 08:13:41 2016 -0700
-+++ b/src/share/vm/runtime/vm_operations.hpp	Sat Feb 18 22:31:11 2017 +0100
++++ b/src/share/vm/runtime/vm_operations.hpp	Fri Mar 03 15:25:55 2017 +0100
 @@ -97,6 +97,7 @@
    template(LinuxDllLoad)                          \
    template(RotateGCLog)                           \
